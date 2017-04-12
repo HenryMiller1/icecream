@@ -10,10 +10,22 @@ matrix:
   include:
   - os: linux
     sudo: true # for setcap so we can run the tests in chroot.
+    dist: precise
+  - os: linux
+    DOCKER_TAG=ubuntu:16.04
+    OS_TAG=ubuntu-16.04
+    services: docker
   - os: osx
     before_install:
       - brew update
       - brew install lzo docbook2x
+
+before_install:
+  - if [[ -n "$DOCKER_TAG" ]]; then
+  -   docker pull ${DOCKER_TAG}
+  -   docker run -it ubuntu bash
+  - fi
+
 
 addons:
   apt:
