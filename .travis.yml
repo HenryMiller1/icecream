@@ -29,6 +29,7 @@ matrix:
 before_install: |
    if [[ -n "$DOCKER_TAG" ]]; then
      docker pull ${DOCKER_TAG}
+     docker run --name bc -v $TRAVIS_BUILD_DIR:/ -td ${DOCKER_TAG} /bin/bash
    fi
 
 
