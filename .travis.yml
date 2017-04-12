@@ -1,10 +1,17 @@
 language: cpp
 
-script:
-  - ./autogen.sh
-  - ./configure --prefix=$PWD/_inst
-  - make
-  - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then make test; fi
+script: |
+  if [[ -n "$DOCKER_TAG" ]]; then
+    docker exec bc sh -c "cd $TRAVIS_BUILD_DIR && ./autogen.sh"
+    docker exec bc sh -c "cd $TRAVIS_BUILD_DIR && ./configure --prefix=$PWD/_inst"
+    docker exec bc sh -c "cd $TRAVIS_BUILD_DIR && make"
+    docker exec bc sh -c "cd $TRAVIS_BUILD_DIR && make test"
+  else
+    ./autogen.sh
+    ./configure --prefix=$PWD/_inst
+    make
+    if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then make test; fi
+  fi
 
 matrix:
   include:
@@ -13,14 +20,16 @@ matrix:
     dist: precise
   - os: linux
     services: docker
-    env: DOCKER_TAG=ubuntu:16.04 OS_TAG=ubuntu-16.04 
+    env: DOCKER_TAG=ubuntu:16.04
   - os: osx
     before_install:
       - brew update
       - brew install lzo docbook2x
 
-before_install:
-   if [[ -n "$DOCKER_TAG" ]]; then docker pull ${DOCKER_TAG}; fi
+before_install: |
+   if [[ -n "$DOCKER_TAG" ]]; then
+     docker pull ${DOCKER_TAG}
+   fi
 
 
 addons:
