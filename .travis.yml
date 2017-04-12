@@ -1,10 +1,10 @@
 language: cpp
 
 script:
-  - ./autogen.sh
-  - ./configure --prefix=$PWD/_inst
-  - make
-  - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then make test; fi
+  ./autogen.sh
+  ./configure --prefix=$PWD/_inst
+  make
+  if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then make test; fi
 
 matrix:
   include:
@@ -20,7 +20,7 @@ matrix:
       - brew install lzo docbook2x
 
 before_install:
-  - if [[ -n "$DOCKER_TAG" ]]; then docker pull ${DOCKER_TAG} && docker run ${DOCKER_TAG} bash ./autogen.sh ; fi
+   if [[ -n "$DOCKER_TAG" ]]; then docker pull ${DOCKER_TAG} ; fi
 
 
 addons:
