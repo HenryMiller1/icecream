@@ -31,7 +31,7 @@ before_install: |
      docker pull ${DOCKER_TAG}
      docker run --name bc -v $TRAVIS_BUILD_DIR:$TRAVIS_BUILD_DIR -td ${DOCKER_TAG} /bin/bash
      docker exec bc sh -c "apt-get update"
-     docker exec bc sh -c "apt-get -y install g++ clang libcap-ng-dev libcap-ng-utils liblzo2-dev docbook2x coreutiles"
+     docker exec bc sh -c "apt-get -y install g++ clang libcap-ng-dev libcap-ng-utils liblzo2-dev docbook2x"
    fi
 
 
