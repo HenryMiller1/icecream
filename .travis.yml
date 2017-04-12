@@ -11,10 +11,6 @@ matrix:
   - os: linux
     sudo: true # for setcap so we can run the tests in chroot.
     dist: precise
-  - os: linux
-    DOCKER_TAG=ubuntu:16.04
-    OS_TAG=ubuntu-16.04
-    services: docker
   - os: osx
     before_install:
       - brew update
