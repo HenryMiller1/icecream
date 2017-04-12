@@ -30,7 +30,7 @@ before_install: |
    if [[ -n "$DOCKER_TAG" ]]; then
      docker pull ${DOCKER_TAG}
      docker run --name bc -v $TRAVIS_BUILD_DIR:$TRAVIS_BUILD_DIR -td ${DOCKER_TAG} /bin/bash
-     docker exec bc sh -c "sudo apt-get -y install g++ clang libcap-ng-dev libcap-ng-utils liblzo2-dev docbook2x realpath
+     docker exec bc sh -c "sudo apt-get -y install g++ clang libcap-ng-dev libcap-ng-utils liblzo2-dev docbook2x realpath"
 
    fi
 
