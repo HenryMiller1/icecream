@@ -23,6 +23,7 @@
 #include <config.h>
 #include <iostream>
 #include "logging.h"
+#include "util.h" 
 #include <fstream>
 #include <signal.h>
 #ifdef __linux__
@@ -65,9 +66,9 @@ void setup_debug(int level, const string &filename, const string &prefix)
         if (fname[0] != '/') {
             char buf[FILENAME_MAX];
 
-            if (getcwd(buf, sizeof(buf))) {
-                fname.insert(0, "/");
-                fname.insert(0, buf);
+            string cwd = get_cwd();
+            fname.insert(0, "/");
+            fname.insert(0, cwd);
             }
         }
 
