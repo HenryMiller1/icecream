@@ -24,6 +24,11 @@ matrix:
           - llvm-toolchain-trusty-4.0
         packages:
           - clang-4.0
+          - libcap-ng-dev
+          - libcap-ng-utils
+          - liblzo2-dev
+          - docbook2x
+          - realpath
     env:
       - NEWCC=clang-4.0
     dist: trusty
