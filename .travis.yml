@@ -1,8 +1,6 @@
 language: cpp
 
 script:
-  - clang-4 --version
-  - clang-4.0 --version
   - ./autogen.sh
   - ./configure --prefix=$PWD/_inst
   - make
@@ -34,7 +32,8 @@ matrix:
           - docbook2x
           - realpath
     env:
-      - NEWCC=clang-4.0
+      - CC=clang-4.0
+      - CXX=clang++4.0
     dist: trusty
   - os: linux
     sudo: true # for setcap so we can run the tests in chroot.
