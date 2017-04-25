@@ -17,7 +17,9 @@ matrix:
     compiler: clang
     dist: trusty
     # Newer Clang
-  - compiler: clang
+  - os: linux
+    sudo: true
+    compiler: clang
     addons:
       apt:
         sources:
