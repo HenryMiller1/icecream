@@ -32,8 +32,7 @@ matrix:
           - docbook2x
           - realpath
     env:
-      - CC=clang-4.0
-      - CXX=clang++4.0
+      - CLANG_VERSION=4.0
     dist: trusty
   - os: linux
     sudo: true # for setcap so we can run the tests in chroot.
@@ -73,6 +72,11 @@ before_script:
          export SAN_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer"
          export LDFLAGS="$UBSAN_FLAGS ${LDFLAGS}"
          export UBSAN_OPTIONS=print_stacktrace=1
+     fi
+  - |
+     if [[ -n "$CLANG_VERSION" ]]; then
+       export CC=clang${CLANG_VERSION}
+       export CXX=clang++${CLANG_VERSION}
      fi
   - |
       export CFLAGS="${SAN_FLAGS} ${CFLAGS} -Wall -Wextra"
