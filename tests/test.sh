@@ -945,10 +945,10 @@ if test -x $CLANGXX; then
     # since the -frewrite-includes transformation apparently makes the debugginfo
     # differ too (although the end results work just as well). So just do not compare.
     # It'd be still nice to check at least somehow that this really works though.
-    if [[ -n "${CLANG_VERSION}" ]]; then]
+    if [[ -n "${CLANG_VERSION}" ]]; then
         mkdir "$testdir/clang-environment"
         pushd "$testdir/clang-environment"
-        icecc-create-env -clang=`which clang-${clang-version}`
+        icecc-create-env -clang=`which clang-${CLANG_VERSION}`
         mv *.tar.gz clang-test-env.tar.gz
         export ICECC_VERSION="$testdir/clang-environment/clang-test-env"
     popd
