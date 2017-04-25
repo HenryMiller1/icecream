@@ -73,11 +73,6 @@ GXX=/usr/bin/g++
 CLANG=/usr/bin/clang
 CLANGXX=/usr/bin/clang++
 
-if [[ -n "${CLANG_VERSION}" ]]; then
-    CLANG=`which clang-${clang-version}`
-    CLANGXX=`which clang++-${clang-version}`
-fi
-
 mkdir -p "$testdir"
 
 skipped_tests=
@@ -950,15 +945,14 @@ if test -x $CLANGXX; then
     # since the -frewrite-includes transformation apparently makes the debugginfo
     # differ too (although the end results work just as well). So just do not compare.
     # It'd be still nice to check at least somehow that this really works though.
-    
-    echo "try clang -- $CLANGXX"
-    
-    ls
-    pwd
-    icecc-create-env -clang=$CLANG
-    ls
-    
-    
+    if [[ -n "${CLANG_VERSION}" ]]; then]
+        mkdir "$testdir/clang-environment"
+        pushd "$testdir/clang-environment"
+        icecc-create-env -clang=`which clang-${clang-version}`
+        mv *.tar.gz clang-test-env.tar.gz
+        export ICECC_VERSION="$testdir/clang-environment/clang-test-env"
+    popd
+
     run_ice "" "remote" 0 $CLANGXX -Wall -Werror -c plain.cpp -o "$testdir"/plain.o
     rm "$testdir"/plain.o
     run_ice "" "remote" 0 $CLANGXX -Wall -Werror -c includes.cpp -o "$testdir"/includes.o
@@ -996,6 +990,9 @@ if test -x $CLANGXX; then
     else
         skipped_tests="$skipped_tests clangplugin"
     fi
+    
+    unset ICECC_VERSION
+    
 else
     skipped_tests="$skipped_tests clang"
 fi
