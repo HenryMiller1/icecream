@@ -950,6 +950,9 @@ if test -x $CLANGXX; then
     # since the -frewrite-includes transformation apparently makes the debugginfo
     # differ too (although the end results work just as well). So just do not compare.
     # It'd be still nice to check at least somehow that this really works though.
+    
+    echo "try clang -- $CLANGXX"
+    
     run_ice "" "remote" 0 $CLANGXX -Wall -Werror -c plain.cpp -o "$testdir"/plain.o
     rm "$testdir"/plain.o
     run_ice "" "remote" 0 $CLANGXX -Wall -Werror -c includes.cpp -o "$testdir"/includes.o
