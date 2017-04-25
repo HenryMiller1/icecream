@@ -1,6 +1,8 @@
 language: cpp
 
 script:
+  - clang --version
+  - clang4 --version
   - ./autogen.sh
   - ./configure --prefix=$PWD/_inst
   - make
