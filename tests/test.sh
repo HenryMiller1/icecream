@@ -73,6 +73,11 @@ GXX=/usr/bin/g++
 CLANG=/usr/bin/clang
 CLANGXX=/usr/bin/clang++
 
+if [[ -n "${CLANG_VERSION} " ]]; then
+    CLANG=`which clang-${clang-version}`
+    CLANGXX=`which clang++-${clang-version}`
+fi
+
 mkdir -p "$testdir"
 
 skipped_tests=
