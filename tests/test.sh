@@ -951,7 +951,8 @@ if test -x $CLANGXX; then
         icecc-create-env -clang=`which clang-${CLANG_VERSION}`
         mv *.tar.gz clang-test-env.tar.gz
         export ICECC_VERSION="$testdir/clang-environment/clang-test-env"
-    popd
+        popd
+    fi
 
     run_ice "" "remote" 0 $CLANGXX -Wall -Werror -c plain.cpp -o "$testdir"/plain.o
     rm "$testdir"/plain.o
