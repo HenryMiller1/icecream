@@ -953,6 +953,12 @@ if test -x $CLANGXX; then
     
     echo "try clang -- $CLANGXX"
     
+    ls
+    pwd
+    icecc-create-env -clang=$CLANG
+    ls
+    
+    
     run_ice "" "remote" 0 $CLANGXX -Wall -Werror -c plain.cpp -o "$testdir"/plain.o
     rm "$testdir"/plain.o
     run_ice "" "remote" 0 $CLANGXX -Wall -Werror -c includes.cpp -o "$testdir"/includes.o
