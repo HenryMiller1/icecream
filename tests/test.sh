@@ -34,12 +34,19 @@ while test -n "$1"; do
 done
 
 icecc="${prefix}/bin/icecc"
+icecc_compilers="${prefix}/libexec/icecc/bin"
 iceccd="${prefix}/sbin/iceccd"
 icecc_scheduler="${prefix}/sbin/icecc-scheduler"
 if [[ -n "${builddir}" ]]; then
     icecc="${builddir}/../client/icecc"
+    icecc_compilers=${builddir}/../client
     iceccd="${builddir}/../daemon/iceccd"
     icecc_scheduler="${builddir}/../scheduler/icecc-scheduler"
+    ln -s ${builddir}/../client/icecc ${builddir}/../client/gcc
+    ln -s ${builddir}/../client/icecc ${builddir}/../client/gxx
+    ln -s ${builddir}/../client/icecc ${builddir}/../client/clang
+    ln -s ${builddir}/../client/icecc ${builddir}/../client/clangxx
+   
 fi
 
 if test -z "$prefix" -o ! -x "$icecc"; then
@@ -475,7 +482,7 @@ make_test()
     echo Running make test $run_number.
     reset_logs remote "make test $run_number"
     make -f Makefile.test OUTDIR="$testdir" clean -s
-    PATH="$prefix"/libexec/icecc/bin:/usr/local/bin:/usr/bin:/bin ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log make -f Makefile.test OUTDIR="$testdir" -j10
+    PATH={icecc_compilers}:/usr/local/bin:/usr/bin:/bin ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log make -f Makefile.test OUTDIR="$testdir" -j10
     local run_result=$?
     echo "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% $run_result"
     if test $run_result -ne 0 -o ! -x "$testdir"/maketest; then
