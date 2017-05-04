@@ -43,9 +43,9 @@ if [[ -n "${builddir}" ]]; then
     iceccd="${builddir}/../daemon/iceccd"
     icecc_scheduler="${builddir}/../scheduler/icecc-scheduler"
     ln -s ${builddir}/../client/icecc ${builddir}/../client/gcc
-    ln -s ${builddir}/../client/icecc ${builddir}/../client/gxx
+    ln -s ${builddir}/../client/icecc ${builddir}/../client/g++
     ln -s ${builddir}/../client/icecc ${builddir}/../client/clang
-    ln -s ${builddir}/../client/icecc ${builddir}/../client/clangxx
+    ln -s ${builddir}/../client/icecc ${builddir}/../client/clang++
    
 fi
 
