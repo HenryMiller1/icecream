@@ -42,12 +42,10 @@ if [[ -n "${builddir}" ]]; then
     icecc_compilers=${builddir}/../client
     iceccd="${builddir}/../daemon/iceccd"
     icecc_scheduler="${builddir}/../scheduler/icecc-scheduler"
-    ln -s ${builddir}/../client/icecc ${builddir}/../client/gcc
-    ln -s ${builddir}/../client/icecc ${builddir}/../client/g++
-    ln -s ${builddir}/../client/icecc ${builddir}/../client/clang
-    ln -s ${builddir}/../client/icecc ${builddir}/../client/clang++
-    file ${builddir}/../client/icecc
-    ls -la ${builddir}/../client/
+    ln  ${builddir}/../client/icecc ${builddir}/../client/gcc
+    ln  ${builddir}/../client/icecc ${builddir}/../client/g++
+    ln  ${builddir}/../client/icecc ${builddir}/../client/clang
+    ln  ${builddir}/../client/icecc ${builddir}/../client/clang++
 fi
 
 if test -z "$prefix" -o ! -x "$icecc"; then
