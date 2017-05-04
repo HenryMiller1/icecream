@@ -482,7 +482,7 @@ make_test()
     echo Running make test $run_number.
     reset_logs remote "make test $run_number"
     make -f Makefile.test OUTDIR="$testdir" clean -s
-    PATH={icecc_compilers}:/usr/local/bin:/usr/bin:/bin ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log make -f Makefile.test OUTDIR="$testdir" -j10
+    PATH=${icecc_compilers}:/usr/local/bin:/usr/bin:/bin ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log make -f Makefile.test OUTDIR="$testdir" -j10
     local run_result=$?
     echo "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% $run_result"
     if test $run_result -ne 0 -o ! -x "$testdir"/maketest; then
