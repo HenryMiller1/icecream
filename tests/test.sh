@@ -46,7 +46,8 @@ if [[ -n "${builddir}" ]]; then
     ln -s ${builddir}/../client/icecc ${builddir}/../client/g++
     ln -s ${builddir}/../client/icecc ${builddir}/../client/clang
     ln -s ${builddir}/../client/icecc ${builddir}/../client/clang++
-   
+    file ${builddir}/../client/icecc
+    ls -la ${builddir}/../client/
 fi
 
 if test -z "$prefix" -o ! -x "$icecc"; then
