@@ -794,7 +794,6 @@ zero_local_jobs_test()
     reset_logs remote $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
     echo Running: $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
     ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o" 
-    #>>"$testdir"/stderr.log
     result=$?
     echo "%%%%%%%%%%%%%%%%%%% $result"
     cat "$testdir"/stderr.log
@@ -960,8 +959,6 @@ if test -z "$chroot_disabled"; then
     make_test 2
 fi
 
-zero_local_jobs_test
-
 if test -z "$debug_fission_disabled"; then
     run_ice "$testdir/plain.o" "remote" 0 "split_dwarf" $GXX -Wall -Werror -gsplit-dwarf -g -c plain.cpp -o "$testdir/"plain.o
 fi
@@ -1016,7 +1013,7 @@ icerun_test
 
 recursive_test
 
-#zero_local_jobs_test
+zero_local_jobs_test
 
 if test -x $CLANGXX; then
     # There's probably not much point in repeating all tests with Clang, but at least
