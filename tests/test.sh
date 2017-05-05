@@ -793,7 +793,7 @@ zero_local_jobs_test()
 
     reset_logs remote $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
     echo Running: $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
-    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o" 2>&1 >>"$testdir"/stderr.log
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o" >>"$testdir"/stderr.log
     result=$?
     echo "%%%%%%%%%%%%%%%%%%% $result"
     cat "$testdir"/stderr.log
