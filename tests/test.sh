@@ -98,7 +98,7 @@ start_iceccd()
 {
     name=$1
     shift
-    ICECC_TEST_SOCKET="$testdir"/socket-${name} $valgrind "${iceccd}" -s localhost:8767 -b "$testdir"/envs-${name} -l "$testdir"/${name}.log -N ${name}  -v -v -v "$@" &
+    ICECC_TEST_SOCKET="$testdir"/socket-${name} $valgrind "${iceccd}" -s localhost:8767 -b "$testdir"/envs-${name} -l "$testdir"/${name}.log -N ${name}  -v -v -v "$@" >>"$testdir"/iceccdstderr_${name}.log &
     pid=$!
     eval ${name}_pid=${pid}
     echo ${pid} > "$testdir"/${name}.pid
@@ -798,6 +798,7 @@ zero_local_jobs_test()
     echo "%%%%%%%%%%%%%%%%%%% $result"
     cat "$testdir"/stderr.log
     echo "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
+    (cd "$testdir" && grep -r "AddressSanitizer")
     if [[ $result -ne 0 ]]; then
         echo "failed to build testfunc.o"
         grep -q "AddressSanitizer failed to allocate"  "$testdir"/stderr.log
@@ -958,6 +959,8 @@ if test -z "$chroot_disabled"; then
     make_test 2
 fi
 
+zero_local_jobs_test
+
 if test -z "$debug_fission_disabled"; then
     run_ice "$testdir/plain.o" "remote" 0 "split_dwarf" $GXX -Wall -Werror -gsplit-dwarf -g -c plain.cpp -o "$testdir/"plain.o
 fi
@@ -1012,7 +1015,7 @@ icerun_test
 
 recursive_test
 
-zero_local_jobs_test
+#zero_local_jobs_test
 
 if test -x $CLANGXX; then
     # There's probably not much point in repeating all tests with Clang, but at least
