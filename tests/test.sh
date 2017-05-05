@@ -793,7 +793,15 @@ zero_local_jobs_test()
 
     reset_logs remote $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
     echo Running: $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
-    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o"
+    ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o" 2>>"$testdir"/stderr.log
+    if [[ ! $? ]]; then
+        grep -q "AddressSanitizer failed to allocate"  "$testdir"/stderr.log
+        if [[ ! $? ]]; then
+            echo "address sanitizer broke, skipping test"
+            skipped_tests="$skipped_tests zero_local_jobs_test"
+            return 0
+        fi
+    fi     
 
     reset_logs remote $GXX -Wall -Werror -c testmainfunc.cpp -o "${testdir}/testmainfunc.o"
     echo Running: $GXX -Wall -Werror -c testmainfunc.cpp -o "${testdir}/testmainfunc.o"
@@ -997,19 +1005,7 @@ fi
 
 icerun_test
 
-
-    # restart local daemon to the as built one
-    kill_daemon localice
-    start_iceccd localice --no-remote -m 2
-    wait_for_proc_sleep 10 $localice_pid
-
 recursive_test
-
-
-    # restart local daemon to the as built one
-    kill_daemon localice
-    start_iceccd localice --no-remote -m 2
-    wait_for_proc_sleep 10 $localice_pid
 
 zero_local_jobs_test
 
