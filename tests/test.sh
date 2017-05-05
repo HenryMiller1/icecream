@@ -796,6 +796,8 @@ zero_local_jobs_test()
     ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=remoteice1 ICECC_DEBUG=debug ICECC_LOGFILE="$testdir"/icecc.log $valgrind "${icecc}" $GXX -Wall -Werror -c testfunc.cpp -o "${testdir}/testfunc.o" 
     if [[ $? -ne 0 ]]; then
         echo "failed to build testfunc.o"
+        cat "$testdir"/iceccdstderr_remoteice1.log
+        echo "%%%%%%%%%%%%%%%%%%%%%%%%%%%"
         grep -q "AddressSanitizer failed to allocate"  "$testdir"/iceccdstderr_remoteice1.log
         if [[ ! $? ]]; then
             echo "address sanitizer broke, skipping test"
