@@ -4,6 +4,7 @@ script:
   - ./autogen.sh
   - ./configure --prefix=$PWD/_inst
   - make
+  - addr2line -e /home/travis/build/icecc/icecream/daemon/iceccd 0x451acb 0x4ff17b 0x502610 0x507fed
   - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then make test; fi
 
 matrix:
