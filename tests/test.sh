@@ -799,7 +799,7 @@ zero_local_jobs_test()
         cat "$testdir"/iceccdstderr_remoteice1.log
         echo "%%%%%%%%%%%%%%%%%%%%%%%%%%%"
         grep -q "AddressSanitizer failed to allocate"  "$testdir"/iceccdstderr_remoteice1.log
-        if [[ ! $? ]]; then
+        if [[ $? ]]; then
             echo "address sanitizer broke, skipping test"
             skipped_tests="$skipped_tests zero_local_jobs_test"
             return 0
