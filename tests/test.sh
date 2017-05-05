@@ -98,7 +98,7 @@ start_iceccd()
 {
     name=$1
     shift
-    ICECC_TEST_SOCKET="$testdir"/socket-${name} $valgrind "${iceccd}" -s localhost:8767 -b "$testdir"/envs-${name} -l "$testdir"/${name}.log -N ${name}  -v -v -v "$@" >>"$testdir"/iceccdstderr_${name}.log &
+    ICECC_TEST_SOCKET="$testdir"/socket-${name} $valgrind "${iceccd}" -s localhost:8767 -b "$testdir"/envs-${name} -l "$testdir"/${name}.log -N ${name}  -v -v -v "$@" 2>>"$testdir"/iceccdstderr_${name}.log &
     pid=$!
     eval ${name}_pid=${pid}
     echo ${pid} > "$testdir"/${name}.pid
