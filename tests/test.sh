@@ -999,6 +999,11 @@ icerun_test
 
 recursive_test
 
+
+    # restart local daemon to the as built one
+    kill_daemon localice
+    start_iceccd localice --no-remote -m 2
+
 zero_local_jobs_test
 
 if test -x $CLANGXX; then
