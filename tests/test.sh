@@ -1001,6 +1001,7 @@ icerun_test
     # restart local daemon to the as built one
     kill_daemon localice
     start_iceccd localice --no-remote -m 2
+    wait_for_proc_sleep 10 $localice_pid
 
 recursive_test
 
