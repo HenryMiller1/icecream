@@ -486,9 +486,15 @@ void CompileServer::updateInConnectivity(bool acceptingIn)
         m_nextConnTime = time(0) + time_offset_table[m_inConnAttempt];
         if(m_inConnAttempt < (table_size - 1))
             m_inConnAttempt++;
-        trace()  << nodeName() << " failed to accept an incoming connection on "
-            << name << ":" << m_remotePort << " attempting again in "
-            << m_nextConnTime - time(0) << " seconds" << endl;
+        trace()  << nodeName();
+        trace()  << " failed to accept an incoming connection on ";
+        trace()  << name;
+        trace()   << ":";
+        trace()   << m_remotePort;
+        trace()   << " attempting again in ";
+        trace()  << m_nextConnTime - time(0);
+        trace()   << " seconds";
+        trace()   << endl;
         close(m_inFd);
         m_inFd = -1;
     }
