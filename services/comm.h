@@ -215,7 +215,7 @@ public:
     std::string name;
     time_t last_talk;
 
-private:
+protected:
     MsgChannel(int _fd, struct sockaddr *, socklen_t, bool text = false);
 
     bool wait_for_protocol();
@@ -228,6 +228,7 @@ private:
     void chop_output(void);
     bool wait_for_msg(int timeout);
 
+private:
     char *msgbuf;
     size_t msgbuflen;
     size_t msgofs;
