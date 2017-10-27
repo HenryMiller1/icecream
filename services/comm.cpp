@@ -22,7 +22,7 @@
     51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 */
 
-#include <config.h>
+#include "config.h"
 
 #include <signal.h>
 #include <sys/types.h>
@@ -86,11 +86,11 @@ bool MsgChannel::read_a_bit()
 
     if (count < 128) {
         inbuflen = (inbuflen + 128 + 127) & ~(size_t) 127;
-        inbuf = (char *) realloc(inbuf, inbuflen);
+        inbuf.reserve(inbuflen);
         count = inbuflen - inofs;
     }
 
-    char *buf = inbuf + inofs;
+    unsigned char *buf = &inbuf[inofs];
     bool error = false;
 
     while (count) {
@@ -117,7 +117,7 @@ bool MsgChannel::read_a_bit()
         break;
     }
 
-    inofs = buf - inbuf;
+    inofs = buf - &inbuf[inofs];
 
     if (!update_state()) {
         error = true;
@@ -139,7 +139,7 @@ bool MsgChannel::update_state(void)
             uint32_t remote_prot = 0;
             unsigned char vers[4];
             //readuint32 (remote_prot);
-            memcpy(vers, inbuf + intogo, 4);
+            memcpy(vers, &inbuf[intogo], 4);
             intogo += 4;
 
             for (int i = 0; i < 4; ++i) {
@@ -219,7 +219,7 @@ bool MsgChannel::update_state(void)
 
             if (inbuflen - intogo < inmsglen) {
                 inbuflen = (inmsglen + intogo + 127) & ~(size_t)127;
-                inbuf = (char *) realloc(inbuf, inbuflen);
+                inbuf.reserve(inbuflen);
             }
 
             instate = FILL_BUF;
@@ -252,7 +252,7 @@ void MsgChannel::chop_input()
        of it, or it is cheap to do.  */
     if (intogo > 8192 || inofs - intogo <= 16) {
         if (inofs - intogo != 0) {
-            memmove(inbuf, inbuf + intogo, inofs - intogo);
+            memmove(&inbuf[0], &inbuf[intogo], inofs - intogo);
         }
 
         inofs -= intogo;
@@ -354,12 +354,12 @@ bool MsgChannel::flush_writebuf(bool blocking)
 MsgChannel &MsgChannel::operator>>(uint32_t &buf)
 {
     if (inofs >= intogo + 4) {
-        if (ptrdiff_t(inbuf + intogo) % 4) {
+        if (ptrdiff_t(&inbuf[intogo]) % 4) {
             uint32_t t_buf[1];
-            memcpy(t_buf, inbuf + intogo, 4);
+            memcpy(t_buf, &inbuf[intogo], 4);
             buf = t_buf[0];
         } else {
-            buf = *(uint32_t *)(inbuf + intogo);
+            buf = *(uint32_t *)(&inbuf[intogo]);
         }
 
         intogo += 4;
@@ -388,7 +388,7 @@ MsgChannel &MsgChannel::operator>>(string &s)
     if (!len || len > inofs - intogo) {
         s = "";
     } else {
-        buf = inbuf + intogo;
+        buf = reinterpret_cast<char*>(&inbuf[intogo]);
         intogo += len;
         s = buf;
     }
@@ -488,7 +488,7 @@ void MsgChannel::readcompressed(unsigned char **uncompressed_buf, size_t &_uclen
     *uncompressed_buf = new unsigned char[uncompressed_len];
 
     if (uncompressed_len && compressed_len) {
-        const lzo_byte *compressed_buf = (lzo_byte *)(inbuf + intogo);
+        const lzo_byte *compressed_buf = (lzo_byte *)(&inbuf[intogo]);
         lzo_voidp wrkmem = (lzo_voidp) malloc(LZO1X_MEM_COMPRESS);
         int ret = lzo1x_decompress(compressed_buf, compressed_len,
                                    *uncompressed_buf, &uncompressed_len, wrkmem);
@@ -553,7 +553,7 @@ void MsgChannel::read_line(string &line)
     if (!text_based || inofs < intogo) {
         line = "";
     } else {
-        line = string(inbuf + intogo, inmsglen);
+        line = string(inbuf[intogo], inmsglen);
         intogo += inmsglen;
 
         while (intogo < inofs && inbuf[intogo] < ' ') {
@@ -793,7 +793,7 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     msgbuflen = 128;
     msgofs = 0;
     msgtogo = 0;
-    inbuf = (char *) malloc(128);
+    inbuf.reserve(128);
     inbuflen = 128;
     inofs = 0;
     intogo = 0;
@@ -866,10 +866,6 @@ MsgChannel::~MsgChannel()
 
     if (msgbuf) {
         free(msgbuf);
-    }
-
-    if (inbuf) {
-        free(inbuf);
     }
 
     if (addr) {

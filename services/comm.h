@@ -32,6 +32,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <vector>
 
 #include "job.h"
 
@@ -214,7 +215,7 @@ public:
     std::string name;
     time_t last_talk;
 
-protected:
+private:
     MsgChannel(int _fd, struct sockaddr *, socklen_t, bool text = false);
 
     bool wait_for_protocol();
@@ -231,7 +232,7 @@ protected:
     size_t msgbuflen;
     size_t msgofs;
     size_t msgtogo;
-    char *inbuf;
+    std::vector<unsigned char> inbuf;
     size_t inbuflen;
     size_t inofs;
     size_t intogo;
