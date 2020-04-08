@@ -1,6 +1,8 @@
-[![Stories in Ready](https://badge.waffle.io/icecc/icecream.png?label=ready&title=Ready)](https://waffle.io/icecc/icecream)
-[![Build Status](https://travis-ci.org/icecc/icecream.svg?branch=master)](https://travis-ci.org/icecc/icecream)
+[![Build Status (Linux & macOS)](https://travis-ci.org/icecc/icecream.svg?branch=master)](https://travis-ci.org/icecc/icecream)
+[![Build Status (FreeBSD)](https://api.cirrus-ci.com/github/icecc/icecream.svg)](https://cirrus-ci.com/github/icecc/icecream)
 [![Codacy Badge](https://api.codacy.com/project/badge/Grade/d0fd9ba53b424b37964340970392eec2)](https://www.codacy.com/app/icecc/icecream?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=icecc/icecream&amp;utm_campaign=Badge_Grade)
+[![Code Quality: Cpp](https://img.shields.io/lgtm/grade/cpp/g/icecc/icecream.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/icecc/icecream/context:cpp)
+[![Total Alerts](https://img.shields.io/lgtm/alerts/g/icecc/icecream.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/icecc/icecream/alerts)
 
 [Icecream](Icecream) was created by SUSE based on distcc. Like distcc,
 [Icecream](Icecream) takes compile jobs from a build and
@@ -80,7 +82,7 @@ first entry in your path, e.g. type
 
      export PATH=/usr/lib/icecc/bin:$PATH
 
-(Hint: put this in \~/.bashrc or /etc/profile to not have to type it in
+(Hint: put this in `~/.bashrc` or `/etc/profile` to not have to type it in
 everytime)
 
 Then you just compile with make -j \<num\>, where
@@ -137,7 +139,7 @@ broadcasting response :
 
      yast2 firewall
 
-Choose "Custom Rules" -\> Add. Enter Source Networ **0/0** Protocol:
+Choose "Custom Rules" -\> Add. Enter Source Network **0/0** Protocol:
 **UDP** Source Port **8765**
 
 ### C compiler
@@ -293,7 +295,7 @@ with "file empty.o" if it's really a i586-linux object file.
 -   now tar that directory and use it on your client as specified above.
 
 My cross compiler for the above case is under
-[http://ktown.kde.org/\~coolo/ppc-osx-create-i586.tar.gz](http://ktown.kde.org/~coolo/ppc-osx-create-i586.tar.gz)
+[http://ktown.kde.org/~coolo/ppc-osx-create-i586.tar.gz](http://ktown.kde.org/~coolo/ppc-osx-create-i586.tar.gz)
 
 Cross-Compiling for embedded targets using icecream
 ------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -381,6 +383,13 @@ And then compile with
 
      export PATH=/opt/ccache/bin:$PATH
 
+In this case icecc's symlinks in /usr/lib/icecc/bin should **not** be 
+in your path, as CCACHE_PREFIX is instructing ccache to explicitly delegate 
+to icecc rather than finding it in the path. If both ccache and icecc's
+symlinks are in the path it is likely the two wrappers will mistake each
+other for the real compiler and icecc will complain that it has recursively
+invoked itself.
+
 Note however that ccache isn't really worth the trouble if you're not
 recompiling your project three times a day from scratch (it adds some
 overhead in comparing the source files and uses quite some disk space).
@@ -441,7 +450,7 @@ In most requirements icecream isn't special, e.g. it doesn't matter what
 distributed compile system you use, you won't have fun if your nodes are
 connected through than less or equal to 10MBit. Note that icecream
 compresses input and output files (using lzo), so you can calculate with
-\~1MBit per compile job - i.e more than make -j10 won't be possible
+~1MBit per compile job - i.e more than make -j10 won't be possible
 without delays.
 
 Remember that more machines are only good if you can use massive
@@ -557,7 +566,13 @@ Icecream on gentoo
 **Be aware** that you have to change the CFLAGS during each gcc update
 too.
 
--   To use icecream with emerge/ebuild use PREROOTPATH=/opt/icecream/lib/icecc/bin
+-   Create soft link for CHOST gcc/g++ e.g.
+    ln -s /opt/icecream/bin/icecc
+    /opt/icecream/libexec/icecc/bin/x86_64-pc-linux-gnu-gcc;
+    ln -s /opt/icecream/bin/icecc
+    /opt/icecream/libexec/icecc/bin/x86_64-pc-linux-gnu-g++
+-   To use icecream with emerge/ebuild use
+    PREROOTPATH="/opt/icecream/libexec/icecc/bin" FEATURES="-network-sandbox"
     emerge bla
 -   Be aware, because your gcc/glibc/binutils are normally compiled with
     processor-specific flags, there is a high chance that your compiler

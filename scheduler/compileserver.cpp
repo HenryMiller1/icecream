@@ -33,6 +33,7 @@
 #include "../services/job.h"
 
 #include "job.h"
+#include "scheduler.h"
 
 
 unsigned int CompileServer::s_hostIdCounter = 0;
@@ -51,6 +52,7 @@ CompileServer::CompileServer(const int fd, struct sockaddr *_addr, const socklen
     , m_state(CONNECTED)
     , m_type(UNKNOWN)
     , m_chrootPossible(false)
+    , m_featuresSupported(0)
     , m_clientCount(0)
     , m_submittedJobsCount(0)
     , m_lastPickId(0)
@@ -130,13 +132,13 @@ bool CompileServer::platforms_compatible(const string &target) const
    environment are compatible.  Return an empty string if none can be
    installed, otherwise return the platform of the first found
    environments which can be installed.  */
-string CompileServer::can_install(const Job *job)
+string CompileServer::can_install(const Job *job, bool ignore_installing) const
 {
     // trace() << "can_install host: '" << cs->host_platform << "' target: '"
     //         << job->target_platform << "'" << endl;
-    if (busyInstalling()) {
+    if (!ignore_installing && busyInstalling()) {
 #if DEBUG_SCHEDULER > 0
-        trace() << nodeName() << " is busy installing since " << time(0) - cs->busyInstalling()
+        trace() << nodeName() << " is busy installing since " << time(0) - busyInstalling()
                 << " seconds." << endl;
 #endif
         return string();
@@ -153,18 +155,57 @@ string CompileServer::can_install(const Job *job)
     return string();
 }
 
-bool CompileServer::is_eligible(const Job *job)
+int CompileServer::maxPreloadCount() const
 {
+    // Always allow one job to be preloaded (sent to the compile server
+    // even though there is no compile slot free for it). Since servers
+    // with multiple cores are capable of handling many jobs at once,
+    // allow one extra preload job for each 4 cores, to minimize stalls
+    // when the compile server is waiting for more jobs to be received.
+    return 1 + (m_maxJobs / 4);
+}
+
+bool CompileServer::is_eligible_ever(const Job *job) const
+{
+    bool jobs_okay = m_maxJobs > 0;
+    // We cannot use just 'protocol', because if the scheduler's protocol
+    // is lower than the daemon's then this is set to the minimum.
+    // But here we are asked about the daemon's protocol version, so check that.
+    bool version_okay = job->minimalHostVersion() <= maximum_remote_protocol;
+    bool features_okay = featuresSupported(job->requiredFeatures());
+    bool eligible = jobs_okay
+                    && (m_chrootPossible || job->submitter() == this)
+                    && version_okay
+                    && features_okay
+                    && m_acceptingInConnection
+                    && can_install(job, true).size()
+                    && check_remote(job);
+#if DEBUG_SCHEDULER > 2
+    trace() << nodeName() << " is_eligible_ever: " << eligible << " (jobs_okay " << jobs_okay
+        << ", version_okay " << version_okay << ", features_okay " << features_okay
+        << ", chroot_or_local " << (m_chrootPossible || job->submitter() == this)
+        << ", accepting " << m_acceptingInConnection << ", can_install " << (can_install(job).size() != 0)
+        << ", check_remote " << check_remote(job) << ")" << endl;
+#endif
+    return eligible;
+}
+
+bool CompileServer::is_eligible_now(const Job *job) const
+{
+    if(!is_eligible_ever(job))
+        return false;
     bool jobs_okay = int(m_jobList.size()) < m_maxJobs;
+    if( m_maxJobs > 0 && int(m_jobList.size()) < m_maxJobs + maxPreloadCount())
+        jobs_okay = true; // allow a job for preloading
     bool load_okay = m_load < 1000;
-    bool version_okay = job->minimalHostVersion() <= protocol;
-    return jobs_okay
-           && (m_chrootPossible || job->submitter() == this)
-           && load_okay
-           && version_okay
-           && m_acceptingInConnection
-           && can_install(job).size()
-           && this->check_remote(job);
+    bool eligible = jobs_okay
+                    && load_okay
+                    && can_install(job, false).size();
+#if DEBUG_SCHEDULER > 2
+    trace() << nodeName() << " is_eligible_now: " << eligible << " (jobs_okay " << jobs_okay
+        << ", load_okay " << load_okay << ")" << endl;
+#endif
+    return eligible;
 }
 
 unsigned int CompileServer::remotePort() const
@@ -303,6 +344,21 @@ void CompileServer::setChrootPossible(const bool possible)
     m_chrootPossible = possible;
 }
 
+bool CompileServer::featuresSupported(unsigned int features) const
+{
+    return ( m_featuresSupported & features ) == features;
+}
+
+unsigned int CompileServer::supportedFeatures() const
+{
+    return m_featuresSupported;
+}
+
+void CompileServer::setSupportedFeatures(unsigned int features)
+{
+    m_featuresSupported = features;
+}
+
 int CompileServer::clientCount() const
 {
     return m_clientCount;
@@ -403,12 +459,12 @@ void CompileServer::eraseClientJobId(const int localJobId)
     m_clientMap.erase(localJobId);
 }
 
-map<CompileServer *, Environments> CompileServer::blacklist() const
+map<const CompileServer *, Environments> CompileServer::blacklist() const
 {
     return m_blacklist;
 }
 
-Environments CompileServer::getEnvsForBlacklistedCS(CompileServer *cs)
+Environments CompileServer::getEnvsForBlacklistedCS(const CompileServer *cs)
 {
     return m_blacklist[cs];
 }
@@ -423,7 +479,7 @@ void CompileServer::eraseCSFromBlacklist(CompileServer *cs)
     m_blacklist.erase(cs);
 }
 
-bool CompileServer::blacklisted(const Job *job, const pair<string, string> &environment)
+bool CompileServer::blacklisted(const Job *job, const pair<string, string> &environment) const
 {
     Environments blacklist = job->submitter()->getEnvsForBlacklistedCS(this);
     return find(blacklist.begin(), blacklist.end(), environment) != blacklist.end();

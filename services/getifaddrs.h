@@ -19,12 +19,17 @@
    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
+#ifndef GETIFADDRS_H
+#define GETIFADDRS_H
+
 /**
  * 02-12-26, tim@tjansen.de: added kde_ prefix, fallback-code,
  *                           removed glibs dependencies
  */
 
 #include "config.h"
+
+#include <string>
 
 #include <sys/types.h>
 
@@ -43,10 +48,6 @@
 #define kde_ifaddrs ifaddrs
 
 #else
-
-#ifndef GETIFADDRS_H
-#define GETIFADDRS_H
-
 
 #include <sys/socket.h>
 
@@ -95,5 +96,13 @@ extern int kde_getifaddrs(struct kde_ifaddrs **__ifap);
 extern void kde_freeifaddrs(struct kde_ifaddrs *__ifa);
 
 #endif
+
+/**
+ * Constructs an IPv4 socket address for a given port and network interface.
+ *
+ * The address is suitable for use by a subsequent call to bind().
+ * If the interface argument is an empty string, the socket will listen on all interfaces.
+ */
+bool build_address_for_interface(struct sockaddr_in &myaddr, const std::string &interface, int port);
 
 #endif

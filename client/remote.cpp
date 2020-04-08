@@ -52,7 +52,8 @@
 #include "tempfile.h"
 #include "md5.h"
 #include "util.h"
-#include "services/util.h"
+#include "../services/util.h"
+#include "pipes.h"
 
 #ifndef O_LARGEFILE
 #define O_LARGEFILE 0
@@ -85,7 +86,7 @@ parse_icecc_version(const string &target_platform, const string &prefix)
 
     // free after the C++-Programming-HOWTO
     string::size_type lastPos = icecc_version.find_first_not_of(',', 0);
-    string::size_type pos     = icecc_version.find_first_of(',', lastPos);
+    string::size_type pos     = icecc_version.find(',', lastPos);
     bool def_targets = icecc_version.find('=') != string::npos;
 
     list<string> platforms;
@@ -104,7 +105,7 @@ parse_icecc_version(const string &target_platform, const string &prefix)
         // Skip delimiters.  Note the "not_of"
         lastPos = icecc_version.find_first_not_of(',', pos);
         // Find next "non-delimiter"
-        pos = icecc_version.find_first_of(',', lastPos);
+        pos = icecc_version.find(',', lastPos);
 
         if (def_targets) {
             colon = version.find('=');
@@ -164,7 +165,7 @@ rip_out_paths(const Environments &envs, map<string, string> &version_map, map<st
 
     Environments env2;
 
-    static const char *suffs[] = { ".tar.bz2", ".tar.gz", ".tar", ".tgz", NULL };
+    static const char *suffs[] = { ".tar.xz", ".tar.zst", ".tar.bz2", ".tar.gz", ".tar", ".tgz", NULL };
 
     string versfile;
 
@@ -197,11 +198,17 @@ get_absfilename(const string &_file)
         file = _file;
     }
 
-    string::size_type idx = file.find("/..");
+    string dots = "/../";
+    string::size_type idx = file.find(dots);
 
     while (idx != string::npos) {
-        file.replace(idx, 3, "/");
-        idx = file.find("/..");
+        if (idx == 0) {
+            file.replace(0, dots.length(), "/");
+        } else {
+          string::size_type slash = file.rfind('/', idx - 1);
+          file.replace(slash, idx-slash+dots.length(), "/");
+        }
+        idx = file.find(dots);
     }
 
     idx = file.find("/./");
@@ -247,7 +254,7 @@ static void check_for_failure(Msg *msg, MsgChannel *cserver)
     }
 }
 
-static void write_server_cpp(int cpp_fd, MsgChannel *cserver)
+static void write_fd_to_server(int fd, MsgChannel *cserver)
 {
     unsigned char buffer[100000]; // some random but huge number
     off_t offset = 0;
@@ -258,16 +265,16 @@ static void write_server_cpp(int cpp_fd, MsgChannel *cserver)
         ssize_t bytes;
 
         do {
-            bytes = read(cpp_fd, buffer + offset, sizeof(buffer) - offset);
+            bytes = read(fd, buffer + offset, sizeof(buffer) - offset);
 
-            if (bytes < 0 && (errno == EINTR || errno == EAGAIN)) {
+            if (bytes < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
                 continue;
             }
 
             if (bytes < 0) {
-                log_perror("reading from cpp_fd");
-                close(cpp_fd);
-                throw client_error(16, "Error 16 - error reading local cpp file");
+                log_perror("write_fd_to_server() reading from fd");
+                close(fd);
+                throw client_error(16, "Error 16 - error reading local file");
             }
 
             break;
@@ -286,7 +293,7 @@ static void write_server_cpp(int cpp_fd, MsgChannel *cserver)
                     log_error() << "write of source chunk to host "
                                 << cserver->name.c_str() << endl;
                     log_perror("failed ");
-                    close(cpp_fd);
+                    close(fd);
                     throw client_error(15, "Error 15 - write to host failed");
                 }
 
@@ -305,7 +312,7 @@ static void write_server_cpp(int cpp_fd, MsgChannel *cserver)
         trace() << "sent " << compressed << " bytes (" << (compressed * 100 / uncompressed) <<
                 "%)" << endl;
 
-    if ((-1 == close(cpp_fd)) && (errno != EBADF)){
+    if ((-1 == close(fd)) && (errno != EBADF)){
         log_perror("close failed");
     }
 }
@@ -427,7 +434,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             EnvTransferMsg msg(job.targetPlatform(), job.environmentVersion());
 
             if (!cserver->send_msg(msg)) {
-                throw client_error(6, "Error 6 - send environment to remove failed");
+                throw client_error(6, "Error 6 - send environment to remote failed");
             }
 
             int env_fd = open(version_file.c_str(), O_RDONLY);
@@ -436,7 +443,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 throw client_error(5, "Error 5 - unable to open version file:\n\t" + version_file);
             }
 
-            write_server_cpp(env_fd, cserver);
+            write_fd_to_server(env_fd, cserver);
 
             if (!cserver->send_msg(EndMsg())) {
                 log_error() << "write of environment failed" << endl;
@@ -501,10 +508,17 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         if (!preproc_file) {
             int sockets[2];
 
-            if (pipe(sockets)) {
+            if (create_large_pipe(sockets) != 0) {
+                log_perror("build_remote_in pipe");
                 /* for all possible cases, this is something severe */
-                exit(errno);
+                throw client_error(32, "Error 18 - (fork error?)");
             }
+
+            if (!dcc_lock_host()) {
+                log_error() << "can't lock for local cpp" << endl;
+                return EXIT_DISTCC_FAILED;
+            }
+            HostUnlock hostUnlock; // automatic dcc_unlock()
 
             /* This will fork, and return the pid of the child.  It will not
                return for the child itself.  If it returns normally it will have
@@ -516,8 +530,8 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             }
 
             try {
-                log_block bl2("write_server_cpp from cpp");
-                write_server_cpp(sockets[0], cserver);
+                log_block bl2("write_fd_to_server from cpp");
+                write_fd_to_server(sockets[0], cserver);
             } catch (...) {
                 kill(cpp_pid, SIGTERM);
                 throw;
@@ -531,7 +545,15 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 delete cserver;
                 cserver = 0;
                 log_warning() << "call_cpp process failed with exit status " << shell_exit_status(status) << endl;
-                return shell_exit_status(status);
+                // GCC's -fdirectives-only has a number of cases that it doesn't handle properly,
+                // so if in such mode preparing the source fails, try again recompiling locally.
+                // This will cause double error in case it is a real error, but it'll build successfully if
+                // it was just -fdirectives-only being broken. In other cases fail directly, Clang's
+                // -frewrite-includes is much more reliable than -fdirectives-only, so is GCC's plain -E.
+                if( !compiler_is_clang(job) && compiler_only_rewrite_includes(job))
+                    throw remote_error(103, "Error 103 - local cpp invocation failed, trying to recompile locally");
+                else
+                    return shell_exit_status(status);
             }
         } else {
             int cpp_fd = open(preproc_file, O_RDONLY);
@@ -540,8 +562,8 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 throw client_error(11, "Error 11 - unable to open preprocessed file");
             }
 
-            log_block cpp_block("write_server_cpp");
-            write_server_cpp(cpp_fd, cserver);
+            log_block cpp_block("write_fd_to_server preprocessed");
+            write_fd_to_server(cpp_fd, cserver);
         }
 
         if (!cserver->send_msg(EndMsg())) {
@@ -586,6 +608,12 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 throw remote_error(102, "Error 102 - command needs stdout/stderr workaround, recompiling locally");
             }
 
+            if (crmsg->err.find("file not found") != string::npos) {
+                delete crmsg;
+                log_info() << "remote is missing file, recompiling locally" << endl;
+                throw remote_error(104, "Error 104 - remote is missing file, recompiling locally");
+            }
+
             ignore_result(write(STDOUT_FILENO, crmsg->out.c_str(), crmsg->out.size()));
 
             if (colorify_wanted(job)) {
@@ -595,7 +623,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             }
 
             if (status && (crmsg->err.length() || crmsg->out.length())) {
-                log_error() << "Compiled on " << hostname << endl;
+                log_info() << "Compiled on " << hostname << endl;
             }
         }
 
@@ -607,7 +635,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         if (status == 0) {
             receive_file(job.outputFile(), cserver);
             if (have_dwo_file) {
-                string dwo_output = job.outputFile().substr(0, job.outputFile().find_last_of('.')) + ".dwo";
+                string dwo_output = job.outputFile().substr(0, job.outputFile().rfind('.')) + ".dwo";
                 receive_file(dwo_output, cserver);
             }
         }
@@ -716,7 +744,7 @@ maybe_build_local(MsgChannel *local_daemon, UseCSMsg *usecs, CompileJob &job,
         if (!stat(job.outputFile().c_str(), &st)) {
             msg.out_uncompressed += st.st_size;
         }
-        if (!stat((job.outputFile().substr(0, job.outputFile().find_last_of('.')) + ".dwo").c_str(), &st)) {
+        if (!stat((job.outputFile().substr(0, job.outputFile().rfind('.')) + ".dwo").c_str(), &st)) {
             msg.out_uncompressed += st.st_size;
         }
 
@@ -748,6 +776,18 @@ static int minimalRemoteVersion( const CompileJob& job)
     }
 
     return version;
+}
+
+static unsigned int requiredRemoteFeatures()
+{
+    unsigned int features = 0;
+    if (const char* icecc_env_compression = getenv( "ICECC_ENV_COMPRESSION" )) {
+        if( strcmp( icecc_env_compression, "xz" ) == 0 )
+            features = features | NODE_FEATURE_ENV_XZ;
+        if( strcmp( icecc_env_compression, "zstd" ) == 0 )
+            features = features | NODE_FEATURE_ENV_ZSTD;
+    }
+    return features;
 }
 
 int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &_envs, int permill)
@@ -800,8 +840,9 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
         GetCSMsg getcs(envs, fake_filename, job.language(), torepeat,
                        job.targetPlatform(), job.argumentFlags(),
                        preferred_host ? preferred_host : string(),
-                       minimalRemoteVersion(job));
+                       minimalRemoteVersion(job), requiredRemoteFeatures());
 
+        trace() << "asking for host to use" << endl;
         if (!local_daemon->send_msg(getcs)) {
             log_warning() << "asked for CS" << endl;
             throw client_error(24, "Error 24 - asked for CS");
@@ -828,6 +869,13 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
         dcc_make_tmpnam("icecc", ".ix", &preproc, 0);
         const CharBufferDeleter preproc_holder(preproc);
         int cpp_fd = open(preproc, O_WRONLY);
+
+        if (!dcc_lock_host()) {
+            log_error() << "can't lock for local cpp" << endl;
+            return EXIT_DISTCC_FAILED;
+        }
+        HostUnlock hostUnlock; // automatic dcc_unlock()
+
         /* When call_cpp returns normally (for the parent) it will have closed
            the write fd, i.e. cpp_fd.  */
         pid_t cpp_pid = call_cpp(job, cpp_fd);
@@ -845,6 +893,7 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
             ::unlink(preproc);
             return shell_exit_status(status);
         }
+        dcc_unlock();
 
         char rand_seed[400]; // "designed to be oversized" (Levi's)
         sprintf(rand_seed, "-frandom-seed=%d", rand());
@@ -853,7 +902,7 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
         GetCSMsg getcs(envs, get_absfilename(job.inputFile()), job.language(), torepeat,
                        job.targetPlatform(), job.argumentFlags(),
                        preferred_host ? preferred_host : string(),
-                       minimalRemoteVersion(job));
+                       minimalRemoteVersion(job), 0);
 
 
         if (!local_daemon->send_msg(getcs)) {
@@ -958,7 +1007,7 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
                             log_perror("unlink outputFile failed") << "\t" << jobs[0].outputFile() << endl;
                         }
                         if (has_split_dwarf) {
-                            string dwo_file = jobs[0].outputFile().substr(0, jobs[0].outputFile().find_last_of('.')) + ".dwo";
+                            string dwo_file = jobs[0].outputFile().substr(0, jobs[0].outputFile().rfind('.')) + ".dwo";
                             if (-1 == ::unlink(dwo_file.c_str())){
                                 log_perror("unlink failed") << "\t" << dwo_file << endl;
                             }
@@ -979,7 +1028,7 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
                                (jobs[0].outputFile() + ".caught").c_str());
                         rename(preproc, (string(preproc) + ".caught").c_str());
                         if (has_split_dwarf) {
-                            string dwo_file = jobs[0].outputFile().substr(0, jobs[0].outputFile().find_last_of('.')) + ".dwo";
+                            string dwo_file = jobs[0].outputFile().substr(0, jobs[0].outputFile().rfind('.')) + ".dwo";
                             rename(dwo_file.c_str(), (dwo_file + ".caught").c_str());
                         }
                         exit_codes[0] = -1; // overwrite
@@ -991,7 +1040,7 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
                     log_perror("unlink failed") << "\t" << jobs[i].outputFile() << endl;
                 }
                 if (has_split_dwarf) {
-                    string dwo_file = jobs[i].outputFile().substr(0, jobs[i].outputFile().find_last_of('.')) + ".dwo";
+                    string dwo_file = jobs[i].outputFile().substr(0, jobs[i].outputFile().rfind('.')) + ".dwo";
                     if (-1 == ::unlink(dwo_file.c_str())){
                         log_perror("unlink failed") << "\t" << dwo_file << endl;
                     }
@@ -1003,7 +1052,7 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
                 log_perror("unlink failed") << "\t" << jobs[0].outputFile() << endl;
             }
             if (has_split_dwarf) {
-                string dwo_file = jobs[0].outputFile().substr(0, jobs[0].outputFile().find_last_of('.')) + ".dwo";
+                string dwo_file = jobs[0].outputFile().substr(0, jobs[0].outputFile().rfind('.')) + ".dwo";
                 if (-1 == ::unlink(dwo_file.c_str())){
                     log_perror("unlink failed") << "\t" << dwo_file << endl;
                 }
@@ -1014,7 +1063,7 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
                     log_perror("unlink failed") << "\t" << jobs[i].outputFile() << endl;
                 }
                 if (has_split_dwarf) {
-                    string dwo_file = jobs[i].outputFile().substr(0, jobs[i].outputFile().find_last_of('.')) + ".dwo";
+                    string dwo_file = jobs[i].outputFile().substr(0, jobs[i].outputFile().rfind('.')) + ".dwo";
                     if (-1 == ::unlink(dwo_file.c_str())){
                         log_perror("unlink failed") << "\t" << dwo_file << endl;
                     }

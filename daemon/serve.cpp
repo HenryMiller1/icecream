@@ -194,7 +194,7 @@ int handle_connection(const string &basedir, CompileJob *job,
             throw myexception(EXIT_DISTCC_FAILED);
         }
 
-        if (::access(_PATH_TMP + 1, W_OK) < 0) {
+        if (::access(&_PATH_TMP[1], W_OK) < 0) {
             error_client(client, "can't write to " _PATH_TMP);
             log_error() << "can't write into " << _PATH_TMP << " " << strerror(errno) << endl;
             throw myexception(-1);
@@ -229,7 +229,7 @@ int handle_connection(const string &basedir, CompileJob *job,
             string job_output_file = job->outputFile();
             string job_working_dir = job->workingDirectory();
 
-            size_t slash_index = job_output_file.find_last_of('/');
+            size_t slash_index = job_output_file.rfind('/');
             string file_dir, file_name;
             if (slash_index != string::npos) {
                 file_dir = job_output_file.substr(0, slash_index);
@@ -260,15 +260,15 @@ int handle_connection(const string &basedir, CompileJob *job,
             }
 
             obj_file = output_dir + '/' + file_name;
-            dwo_file = obj_file.substr(0, obj_file.find_last_of('.')) + ".dwo";
+            dwo_file = obj_file.substr(0, obj_file.rfind('.')) + ".dwo";
 
             ret = work_it(*job, job_stat, client, rmsg, tmp_path, job_working_dir, relative_file_path, mem_limit, client->fd);
         }
         else if (!job->dwarfFissionEnabled() && (ret = dcc_make_tmpnam(prefix_output, ".o", &tmp_output, 0)) == 0) {
             obj_file = tmp_output;
             free(tmp_output);
-            string build_path = obj_file.substr(0, obj_file.find_last_of('/'));
-            string file_name = obj_file.substr(obj_file.find_last_of('/')+1);
+            string build_path = obj_file.substr(0, obj_file.rfind('/'));
+            string file_name = obj_file.substr(obj_file.rfind('/')+1);
 
             ret = work_it(*job, job_stat, client, rmsg, build_path, "", file_name, mem_limit, client->fd);
         }
@@ -286,18 +286,19 @@ int handle_connection(const string &basedir, CompileJob *job,
             }
         }
 
+        struct stat st;
+        if (stat(obj_file.c_str(), &st) == 0) {
+            job_stat[JobStatistics::out_uncompressed] += st.st_size;
+        }
+        if (stat(dwo_file.c_str(), &st) == 0) {
+            job_stat[JobStatistics::out_uncompressed] += st.st_size;
+            rmsg.have_dwo_file = true;
+        } else
+            rmsg.have_dwo_file = false;
+
         if (!client->send_msg(rmsg)) {
             log_info() << "write of result failed" << endl;
             throw myexception(EXIT_DISTCC_FAILED);
-        }
-
-        struct stat st;
-
-        if (!stat(obj_file.c_str(), &st)) {
-            job_stat[JobStatistics::out_uncompressed] += st.st_size;
-        }
-        if (!stat(dwo_file.c_str(), &st)) {
-            job_stat[JobStatistics::out_uncompressed] += st.st_size;
         }
 
         /* wake up parent and tell him that compile finished */
@@ -314,29 +315,30 @@ int handle_connection(const string &basedir, CompileJob *job,
             }
         }
 
-        throw myexception(rmsg.status);
+        exit_code = rmsg.status;
 
     } catch (const myexception& e) {
-        delete client;
-        client = 0;
-
-        if (!obj_file.empty()) {
-            if (-1 == unlink(obj_file.c_str()) && errno != ENOENT){
-                log_perror("unlink failure") << "\t" << obj_file << endl;
-            }
-        }
-        if (!dwo_file.empty()) {
-            if (-1 == unlink(dwo_file.c_str()) && errno != ENOENT){
-                log_perror("unlink failure") << "\t" << dwo_file << endl;
-            }
-        }
-        if (!tmp_path.empty()) {
-            rmpath(tmp_path.c_str());
-        }
-
-        delete job;
-
         exit_code = e.exitcode();
     }
+
+    delete client;
+    client = 0;
+
+    if (!obj_file.empty()) {
+        if (-1 == unlink(obj_file.c_str()) && errno != ENOENT){
+            log_perror("unlink failure") << "\t" << obj_file << endl;
+        }
+    }
+    if (!dwo_file.empty()) {
+        if (-1 == unlink(dwo_file.c_str()) && errno != ENOENT){
+            log_perror("unlink failure") << "\t" << dwo_file << endl;
+        }
+    }
+    if (!tmp_path.empty()) {
+        rmpath(tmp_path.c_str());
+    }
+
+    delete job;
+
     _exit(exit_code);
 }

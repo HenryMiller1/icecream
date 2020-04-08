@@ -97,7 +97,10 @@ static void dcc_show_usage(void)
         "   ICECC_EXTRAFILES           additional files used in the compilation.\n"
         "   ICECC_COLOR_DIAGNOSTICS    set to 1 or 0 to override color diagnostics support.\n"
         "   ICECC_CARET_WORKAROUND     set to 1 or 0 to override gcc show caret workaround.\n"
-        "\n");
+        "   ICECC_COMPRESSION          if set, the libzstd compression level (1 to 19, default: 1)\n"
+        "   ICECC_ENV_COMPRESSION      compression type for icecc environments [none|gzip|bzip2|zstd|xz]\n"
+        "   ICECC_SLOW_NETWORK         set to 1 to send network data in smaller chunks\n"
+        );
 }
 
 static void icerun_show_usage(void)
@@ -162,7 +165,7 @@ static int create_native(char **args)
         } else if( access( args[0], R_OK ) == 0 && access( args[ 0 ], X_OK ) != 0 ) {
             // backwards compatibility, the first argument is already an extra file
         } else {
-            compiler = compiler_path_lookup( args[ 0 ] );
+            compiler = compiler_path_lookup( get_c_compiler( args[ 0 ] ));
             if (compiler.empty()) {
                 log_error() << "compiler not found" << endl;
                 return 1;
@@ -172,12 +175,6 @@ static int create_native(char **args)
     }
 
     vector<char*> argv;
-    struct stat st;
-
-    if (lstat(BINDIR "/icecc-create-env", &st)) {
-        log_error() << BINDIR "/icecc-create-env does not exist" << endl;
-        return 1;
-    }
 
     argv.push_back(strdup(BINDIR "/icecc-create-env"));
     argv.push_back(strdup(compiler.c_str()));
@@ -187,10 +184,17 @@ static int create_native(char **args)
         argv.push_back(strdup(extrafiles[extracount]));
     }
 
+    if( const char* env_compression = getenv( "ICECC_ENV_COMPRESSION" )) {
+        argv.push_back(strdup("--compression"));
+        argv.push_back(strdup(env_compression));
+    }
+
     argv.push_back(NULL);
     execv(argv[0], argv.data());
-    log_perror("execv failed");
-    return -1;
+    ostringstream errmsg;
+    errmsg << "execv " << argv[0] << " failed";
+    log_perror(errmsg.str());
+    return 1;
 }
 
 static MsgChannel* get_local_daemon()
@@ -402,10 +406,10 @@ int main(int argc, char **argv)
     local |= analyse_argv(argv, job, icerun, &extrafiles);
 
     /* If ICECC is set to disable, then run job locally, without contacting
-       the daemon at all. Because of file-based locking that is used in this
-       case, all calls will be serialized and run by one.
+       the daemon at all. File-based locking will still ensure that all
+       calls are serialized up to the number of local cpus available.
        If ICECC is set to no, the job is run locally as well, but it is
-       serialized using the daemon, so several may be run at once.
+       serialized using the daemon.
      */
     if (icecc && !strcasecmp(icecc, "disable")) {
         assert( local_daemon == NULL );
@@ -467,8 +471,17 @@ int main(int argc, char **argv)
             local = true;
         } else {
             Msg *umsg = NULL;
-            if (!local_daemon->send_msg(GetNativeEnvMsg(compiler_is_clang(job)
-                                        ? "clang" : "gcc", extrafiles))) {
+            string compiler;
+            if( IS_PROTOCOL_41(local_daemon))
+                compiler = get_absfilename( find_compiler( job ));
+            else // Older daemons understood only two hardcoded compilers.
+                compiler = compiler_is_clang(job) ? "clang" : "gcc";
+            string env_compression; // empty = default
+            if( const char* icecc_env_compression = getenv( "ICECC_ENV_COMPRESSION" ))
+                env_compression = icecc_env_compression;
+            trace() << "asking for native environment for " << compiler << endl;
+            if (!local_daemon->send_msg(GetNativeEnvMsg(compiler, extrafiles,
+                env_compression))) {
                 log_warning() << "failed to write get native environment" << endl;
                 local = true;
             } else {
@@ -528,7 +541,12 @@ int main(int argc, char **argv)
                 local_daemon->send_msg(EndMsg());
             }
         } catch (remote_error& error) {
-            log_info() << "local build forced by remote exception: " << error.what() << endl;
+            // log the 'local cpp invocation failed' message by default, so that it's more
+            // obvious why the cpp output is there (possibly) twice
+            if( error.errorCode == 103 )
+                log_error() << "local build forced by remote exception: " << error.what() << endl;
+            else
+                log_info() << "local build forced by remote exception: " << error.what() << endl;
             local = true;
         }
         catch (client_error& error) {

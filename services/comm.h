@@ -36,7 +36,7 @@
 #include "job.h"
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
-#define PROTOCOL_VERSION 39
+#define PROTOCOL_VERSION 42
 // if you increase the MIN_PROTOCOL_VERSION, comment out macros below and clean up the code
 #define MIN_PROTOCOL_VERSION 21
 
@@ -64,6 +64,9 @@
 #define IS_PROTOCOL_37(c) ((c)->protocol >= 37)
 #define IS_PROTOCOL_38(c) ((c)->protocol >= 38)
 #define IS_PROTOCOL_39(c) ((c)->protocol >= 39)
+#define IS_PROTOCOL_40(c) ((c)->protocol >= 40)
+#define IS_PROTOCOL_41(c) ((c)->protocol >= 41)
+#define IS_PROTOCOL_42(c) ((c)->protocol >= 42)
 
 // Terms used:
 // S  = scheduler
@@ -92,7 +95,7 @@ enum MsgType {
     // C --> S
     M_GET_CS,
     // S --> C
-    M_USE_CS,  // = 'G'
+    M_USE_CS,  // = 'H'
     // C --> CS
     M_COMPILE_FILE, // = 'I'
     // generic file transfer
@@ -124,7 +127,7 @@ enum MsgType {
     M_TRANFER_ENV, // = 'X'
 
     M_TEXT,
-    M_STATUS_TEXT,
+    M_STATUS_TEXT, // = 'Z'
     M_GET_INTERNALS,
 
     // S --> CS, answered by M_LOGIN
@@ -139,6 +142,16 @@ enum MsgType {
     // S --> CS
     M_NO_CS
 };
+
+enum Compression {
+    C_LZO = 0,
+    C_ZSTD = 1
+};
+
+// The remote node is capable of unpacking environment compressed as .tar.xz .
+const int NODE_FEATURE_ENV_XZ = ( 1 << 0 );
+// The remote node is capable of unpacking environment compressed as .tar.zst .
+const int NODE_FEATURE_ENV_ZSTD = ( 1 << 1 );
 
 class MsgChannel;
 
@@ -220,6 +233,8 @@ public:
 
     // the minimum protocol version between me and him
     int protocol;
+    // the actual maximum protocol the remote supports
+    int maximum_remote_protocol;
 
     std::string name;
     time_t last_talk;
@@ -265,6 +280,7 @@ private:
     // deep copied
     struct sockaddr *addr;
     socklen_t addr_len;
+    bool set_error_recursion;
 };
 
 // just convenient functions to create MsgChannels
@@ -408,18 +424,8 @@ public:
              CompileJob::Language _lang, unsigned int _count,
              std::string _target, unsigned int _arg_flags,
              const std::string &host, int _minimal_host_version,
-             unsigned int _client_count = 0)
-        : Msg(M_GET_CS)
-        , versions(envs)
-        , filename(f)
-        , lang(_lang)
-        , count(_count)
-        , target(_target)
-        , arg_flags(_arg_flags)
-        , client_id(0)
-        , preferred_host(host)
-        , minimal_host_version(_minimal_host_version)
-        , client_count(_client_count) {}
+             unsigned int _required_features,
+             unsigned int _client_count = 0);
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
@@ -433,6 +439,7 @@ public:
     uint32_t client_id;
     std::string preferred_host;
     int minimal_host_version;
+    uint32_t required_features;
     uint32_t client_count; // number of CS -> C connections at the moment
 };
 
@@ -487,16 +494,20 @@ public:
     GetNativeEnvMsg()
         : Msg(M_GET_NATIVE_ENV) {}
 
-    GetNativeEnvMsg(const std::string &c, const std::list<std::string> &e)
+    GetNativeEnvMsg(const std::string &c, const std::list<std::string> &e,
+        const std::string &comp)
         : Msg(M_GET_NATIVE_ENV)
         , compiler(c)
-        , extrafiles(e) {}
+        , extrafiles(e)
+        , compression(comp)
+        {}
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
 
-    std::string compiler; // "gcc" or "clang" right now
+    std::string compiler; // "gcc", "clang" or the actual binary
     std::list<std::string> extrafiles;
+    std::string compression; // "" (=default), "none", "gzip", "xz", etc.
 };
 
 class UseNativeEnvMsg : public Msg
@@ -699,7 +710,8 @@ public:
 class LoginMsg : public Msg
 {
 public:
-    LoginMsg(unsigned int myport, const std::string &_nodename, const std::string &_host_platform);
+    LoginMsg(unsigned int myport, const std::string &_nodename, const std::string &_host_platform,
+             unsigned int my_features);
     LoginMsg()
         : Msg(M_LOGIN)
         , port(0) {}
@@ -714,6 +726,7 @@ public:
     bool chroot_possible;
     std::string nodename;
     std::string host_platform;
+    uint32_t supported_features; // bitmask of various features the node supports
 };
 
 class ConfCSMsg : public Msg

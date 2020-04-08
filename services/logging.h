@@ -118,6 +118,11 @@ static inline std::ostream & log_perror(const char *prefix)
     return log_errno(prefix, errno);
 }
 
+static inline std::ostream & log_perror(const std::string &prefix)
+{
+    return log_perror(prefix.c_str());
+}
+
 static inline std::ostream & log_errno_trace(const char *prefix, int tmp_errno)
 {
     return trace() << prefix << "(Error: " << strerror(tmp_errno) << ")" << std::endl;
@@ -137,8 +142,6 @@ class log_block
 public:
     log_block(const char *label = 0)
     {
-#ifndef NDEBUG
-
         for (unsigned i = 0; i < nesting; ++i) {
             log_info() << "  ";
         }
@@ -148,12 +151,10 @@ public:
         m_label = strdup(label ? label : "");
         ++nesting;
         gettimeofday(&m_start, 0);
-#endif
     }
 
     ~log_block()
     {
-#ifndef NDEBUG
         timeval end;
         gettimeofday(&end, 0);
 
@@ -168,7 +169,6 @@ public:
                    << "ms>\n";
 
         free(m_label);
-#endif
     }
 };
 

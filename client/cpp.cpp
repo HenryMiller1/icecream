@@ -113,10 +113,11 @@ pid_t call_cpp(CompileJob &job, int fdwrite, int fdread)
         argv[2] = 0;
     } else {
         list<string> flags = job.localFlags();
+        appendList(flags, job.restFlags());
 
-        /* This has a duplicate meaning. it can either include a file
-           for preprocessing or a precompiled header. decide which one.  */
         for (list<string>::iterator it = flags.begin(); it != flags.end();) {
+            /* This has a duplicate meaning. it can either include a file
+               for preprocessing or a precompiled header. decide which one.  */
             if ((*it) == "-include") {
                 ++it;
 
@@ -124,6 +125,7 @@ pid_t call_cpp(CompileJob &job, int fdwrite, int fdread)
                     std::string p = (*it);
 
                     if (access(p.c_str(), R_OK) < 0 && access((p + ".gch").c_str(), R_OK) == 0) {
+                        // PCH is useless for preprocessing, ignore the flag.
                         list<string>::iterator o = --it;
                         it++;
                         flags.erase(o);
@@ -131,12 +133,35 @@ pid_t call_cpp(CompileJob &job, int fdwrite, int fdread)
                         flags.erase(o);
                     }
                 }
+            } else if ((*it) == "-include-pch") {
+                list<string>::iterator o = it;
+                ++it;
+                if (it != flags.end()) {
+                    std::string p = (*it);
+                    if (access(p.c_str(), R_OK) == 0) {
+                        // PCH is useless for preprocessing (and probably slows things down), ignore the flag.
+                        flags.erase(o);
+                        o = it++;
+                        flags.erase(o);
+                    }
+                }
+            } else if ((*it) == "-fpch-preprocess") {
+                // This would add #pragma GCC pch_preprocess to the preprocessed output, which would make
+                // the remote GCC try to load the PCH directly and fail. Just drop it. This may cause a build
+                // failure if the -include check above failed to detect usage of a PCH file (e.g. because
+                // it needs to be found in one of the -I paths, which we don't check) and the header file
+                // itself doesn't exist.
+                flags.erase(it++);
+            } else if ((*it) == "-fmodules" || (*it) == "-fcxx-modules" || (*it) == "-fmodules-ts"
+                || (*it).find("-fmodules-cache-path=") == 0) {
+                // Clang modules, handle like with PCH, remove the flags and compile remotely
+                // without them.
+                flags.erase(it++);
             } else {
                 ++it;
             }
         }
 
-        appendList(flags, job.restFlags());
         int argc = flags.size();
         argc++; // the program
         argc += 2; // -E file.i
@@ -180,6 +205,8 @@ pid_t call_cpp(CompileJob &job, int fdwrite, int fdread)
     dcc_increment_safeguard(SafeguardStepCompiler);
     execv(argv[0], argv);
     int exitcode = ( errno == ENOENT ? 127 : 126 );
-    log_perror("execv failed");
+    ostringstream errmsg;
+    errmsg << "execv " << argv[0] << " failed";
+    log_perror(errmsg.str());
     _exit(exitcode);
 }

@@ -44,6 +44,7 @@
 #include "exitcode.h"
 #include "job.h"
 #include "logging.h"
+#include "ncpus.h"
 #include "util.h"
 
 using namespace std;
@@ -99,33 +100,6 @@ int dcc_ignore_sigpipe(int val)
 }
 
 /**
- * Return a pointer to the basename of the file (everything after the
- * last slash.)  If there is no slash, return the whole filename,
- * which is presumably in the current directory.
- **/
-string find_basename(const string &sfile)
-{
-    size_t index = sfile.find_last_of('/');
-
-    if (index == string::npos) {
-        return sfile;
-    }
-
-    return sfile.substr(index + 1);
-}
-
-string find_prefix(const string &basename)
-{
-    size_t index = basename.find_last_of('-');
-
-    if (index == string::npos) {
-        return "";
-    }
-
-    return basename.substr(0, index);
-}
-
-/**
  * Get an exclusive, non-blocking lock on a file using whatever method
  * is available on this system.
  *
@@ -153,15 +127,14 @@ static int sys_lock(int fd, bool block)
 }
 
 
-bool dcc_unlock(int lock_fd)
-{
-    /* All our current locks can just be closed */
-    if (close(lock_fd)) {
-        log_perror("close failed:");
-        return false;
-    }
+static volatile int lock_fd = -1;
 
-    return true;
+void dcc_unlock()
+{
+    // This must be safe to use from a signal handler.
+    if (lock_fd != -1)
+        close(lock_fd); // All our current locks can just be closed.
+    lock_fd = -1;
 }
 
 
@@ -179,15 +152,21 @@ static bool dcc_open_lockfile(const string &fname, int &plockfd)
     plockfd = open(fname.c_str(), O_WRONLY | O_CREAT, 0666);
 
     if (plockfd == -1 && errno != EEXIST) {
-        log_error() << "failed to creat " << fname << ": " << strerror(errno) << endl;
+        log_error() << "failed to create " << fname << ": " << strerror(errno) << endl;
         return false;
     }
+
+    set_cloexec_flag(plockfd, true);
 
     return true;
 }
 
-bool dcc_lock_host(int &lock_fd)
+static bool dcc_lock_host_slot(string fname, int lock, bool block);
+
+bool dcc_lock_host()
 {
+    assert(lock_fd == -1);
+
     string fname = "/tmp/.icecream-";
     struct passwd *pwd = getpwuid(getuid());
 
@@ -205,14 +184,35 @@ bool dcc_lock_host(int &lock_fd)
     }
 
     fname += "/local_lock";
-
     lock_fd = 0;
+    int max_cpu = 1;
+    dcc_ncpus(&max_cpu);
+    // To ensure better distribution, select a "random" starting slot.
+    int lock_offset = getpid();
+    // First try if any slot is free.
+    for( int lock = 0; lock < max_cpu; ++lock ) {
+        if( dcc_lock_host_slot( fname, ( lock + lock_offset ) % max_cpu, false ))
+            return true;
+    }
+    // If not, block on the first selected one.
+    return dcc_lock_host_slot( fname, lock_offset % max_cpu, true );
+}
 
-    if (!dcc_open_lockfile(fname, lock_fd)) {
+bool dcc_lock_host_slot(string fname, int lock, bool block)
+{
+    if( lock > 0 ) { // 1st keep without the 0 for backwards compatibility
+        char num[ 20 ];
+        sprintf( num, "%d", lock );
+        fname += num;
+    }
+
+    int fd = 0;
+    if (!dcc_open_lockfile(fname, fd)) {
         return false;
     }
 
-    if (sys_lock(lock_fd, true) == 0) {
+    if (sys_lock(fd, block) == 0) {
+        lock_fd = fd;
         return true;
     }
 
@@ -222,14 +222,15 @@ bool dcc_lock_host(int &lock_fd)
 #endif
     case EAGAIN:
     case EACCES: /* HP-UX and Cygwin give this for exclusion */
-        trace() << fname << " is busy" << endl;
+        if( block )
+            trace() << fname << " is busy" << endl;
         break;
     default:
         log_error() << "lock " << fname << " failed: " << strerror(errno) << endl;
         break;
     }
 
-    if ((-1 == ::close(lock_fd)) && (errno != EBADF)){
+    if ((-1 == ::close(fd)) && (errno != EBADF)){
         log_perror("close failed");
     }
     return false;

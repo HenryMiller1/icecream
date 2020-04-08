@@ -27,6 +27,7 @@
 #include "assert.h"
 #include "exitcode.h"
 #include "logging.h"
+#include "pipes.h"
 #include <sys/select.h>
 #include <algorithm>
 
@@ -45,7 +46,6 @@
 #if HAVE_SYS_USER_H && !defined(__DragonFly__)
 #  include <sys/user.h>
 #endif
-#include <sys/socket.h>
 
 #ifdef HAVE_SYS_VFS_H
 #include <sys/vfs.h>
@@ -103,10 +103,9 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
     rmsg.out.erase(rmsg.out.begin(), rmsg.out.end());
     rmsg.out.erase(rmsg.out.begin(), rmsg.out.end());
 
-    std::list<string> list = j.remoteFlags();
-    appendList(list, j.restFlags());
+    std::list<string> list = j.nonLocalFlags();
 
-    if (j.dwarfFissionEnabled()) {
+    if (!IS_PROTOCOL_41(client) && j.dwarfFissionEnabled()) {
         list.push_back("-gsplit-dwarf");
     }
 
@@ -142,19 +141,8 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
         return EXIT_DISTCC_FAILED;
     }
 
-    // We use a socket pair instead of a pipe to get a "slightly" bigger
-    // output buffer. This saves context switches and latencies.
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sock_in) < 0) {
+    if (create_large_pipe(sock_in)) {
         return EXIT_DISTCC_FAILED;
-    }
-
-    int maxsize = 2 * 1024 * 2024;
-#ifdef SO_SNDBUFFORCE
-
-    if (setsockopt(sock_in[1], SOL_SOCKET, SO_SNDBUFFORCE, &maxsize, sizeof(maxsize)) < 0)
-#endif
-    {
-        setsockopt(sock_in[1], SOL_SOCKET, SO_SNDBUF, &maxsize, sizeof(maxsize));
     }
 
     if (fcntl(sock_in[1], F_SETFL, O_NONBLOCK)) {
@@ -229,7 +217,6 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
         argc++; // the program
         argc += 6; // -x c - -o file.o -fpreprocessed
         argc += 4; // gpc parameters
-        argc += 1; // -pipe
         argc += 9; // clang extra flags
         char **argv = new char*[argc + 1];
         int i = 0;
@@ -285,23 +272,13 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
             error_client(client, "/tmp dir missing?");
         }
 
-        bool hasPipe = false;
-
         for (std::list<string>::const_iterator it = list.begin();
                 it != list.end(); ++it) {
-            if (*it == "-pipe") {
-                hasPipe = true;
-            }
-
             argv[i++] = strdup(it->c_str());
         }
 
         if (!clang) {
             argv[i++] = strdup("-fpreprocessed");
-        }
-
-        if (!hasPipe) {
-            argv[i++] = strdup("-pipe");
         }
 
         argv[i++] = strdup("-");
@@ -436,6 +413,7 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
         if (n == 1) {
             rmsg.status = resultByte;
 
+            log_error() << "compiler did not start" << endl;
             error_client(client, "compiler did not start");
             return EXIT_COMPILER_MISSING;
         }
@@ -500,7 +478,7 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                     }
                 }
             } else if (client->at_eof()) {
-                log_error() << "unexpected EOF while reading preprocessed file" << endl;
+                log_warning() << "unexpected EOF while reading preprocessed file" << endl;
                 input_complete = true;
                 return_value = EXIT_IO_ERROR;
                 client_fd = -1;
@@ -510,36 +488,35 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
             }
         }
 
-        fd_set rfds;
-        FD_ZERO(&rfds);
+        vector< pollfd > pollfds;
+        pollfd pfd; // tmp variable
 
         if (sock_out[0] >= 0) {
-            FD_SET(sock_out[0], &rfds);
+            pfd.fd = sock_out[0];
+            pfd.events = POLLIN;
+            pollfds.push_back(pfd);
         }
 
         if (sock_err[0] >= 0) {
-            FD_SET(sock_err[0], &rfds);
+            pfd.fd = sock_err[0];
+            pfd.events = POLLIN;
+            pollfds.push_back(pfd);
         }
-
-        int max_fd = std::max(sock_out[0], sock_err[0]);
 
         if (sock_in[1] == -1 && fcmsg) {
             // This state can occur when the compiler has terminated before
             // all file input is received from the client.  The daemon must continue
             // reading all file input from the client because the client expects it to.
-            // Deleting the file chunk message here tricks the select() below to continue
+            // Deleting the file chunk message here tricks the poll() below to continue
             // listening for more file data from the client even though it is being
             // thrown away.
             delete fcmsg;
             fcmsg = 0;
         }
         if (client_fd >= 0 && !fcmsg) {
-            FD_SET(client_fd, &rfds);
-
-            if (client_fd > max_fd) {
-                max_fd = client_fd;
-            }
-
+            pfd.fd = client_fd;
+            pfd.events = POLLIN;
+            pollfds.push_back(pfd);
             // Note that we don't actually query the status of this fd -
             // we poll it in every iteration.
         }
@@ -552,40 +529,26 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
         // The client isn't coded to properly handle the closing of the socket while
         // sending all file data to the daemon.
         if (input_complete) {
-            FD_SET(death_pipe[0], &rfds);
-
-            if (death_pipe[0] > max_fd) {
-                max_fd = death_pipe[0];
-            }
+            pfd.fd = death_pipe[0];
+            pfd.events = POLLIN;
+            pollfds.push_back(pfd);
         }
-
-        fd_set wfds, *wfdsp = 0;
-        FD_ZERO(&wfds);
 
         // Don't try to write to sock_in it if was already closed because
         // the compile terminated before reading all of the file data.
         if (fcmsg && sock_in[1] != -1) {
-            FD_SET(sock_in[1], &wfds);
-            wfdsp = &wfds;
-
-            if (sock_in[1] > max_fd) {
-                max_fd = sock_in[1];
-            }
+            pfd.fd = sock_in[1];
+            pfd.events = POLLOUT;
+            pollfds.push_back(pfd);
         }
 
-        struct timeval tv, *tvp = 0;
+        int timeout = input_complete ? -1 : 60 * 1000;
 
-        if (!input_complete) {
-            tv.tv_sec = 60;
-            tv.tv_usec = 0;
-            tvp = &tv;
-        }
-
-        switch (select(max_fd + 1, &rfds, wfdsp, 0, tvp)) {
+        switch (poll(pollfds.data(), pollfds.size(), timeout)) {
         case 0:
 
             if (!input_complete) {
-                log_error() << "timeout while reading preprocessed file" << endl;
+                log_warning() << "timeout while reading preprocessed file" << endl;
                 kill(pid, SIGTERM); // Won't need it any more ...
                 return_value = EXIT_IO_ERROR;
                 client_fd = -1;
@@ -609,7 +572,7 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
             return EXIT_DISTCC_FAILED;
         default:
 
-            if (fcmsg && FD_ISSET(sock_in[1], &wfds)) {
+            if (fcmsg && pollfd_is_set(pollfds, sock_in[1], POLLOUT)) {
                 ssize_t bytes = write(sock_in[1], fcmsg->buffer + off, fcmsg->len - off);
 
                 if (bytes < 0) {
@@ -645,7 +608,7 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                 }
             }
 
-            if (sock_out[0] >= 0 && FD_ISSET(sock_out[0], &rfds)) {
+            if (sock_out[0] >= 0 && pollfd_is_set(pollfds, sock_out[0], POLLIN)) {
                 ssize_t bytes = read(sock_out[0], buffer, sizeof(buffer) - 1);
 
                 if (bytes > 0) {
@@ -659,7 +622,7 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                 }
             }
 
-            if (sock_err[0] >= 0 && FD_ISSET(sock_err[0], &rfds)) {
+            if (sock_err[0] >= 0 && pollfd_is_set(pollfds, sock_err[0], POLLIN)) {
                 ssize_t bytes = read(sock_err[0], buffer, sizeof(buffer) - 1);
 
                 if (bytes > 0) {
@@ -673,7 +636,7 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                 }
             }
 
-            if (FD_ISSET(death_pipe[0], &rfds)) {
+            if (pollfd_is_set(pollfds, death_pipe[0], POLLIN)) {
                 // Note that we have already read any remaining stdout/stderr:
                 // the sigpipe is delivered after everything was written,
                 // and the notification is multiplexed into the select above.
@@ -688,6 +651,10 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                 }
 
                 if (shell_exit_status(status) != 0) {
+                    if( !rmsg.out.empty())
+                        trace() << "compiler produced stdout output:\n" << rmsg.out;
+                    if( !rmsg.err.empty())
+                        trace() << "compiler produced stderr output:\n" << rmsg.err;
                     unsigned long int mem_used = ((ru.ru_minflt + ru.ru_majflt) * getpagesize()) / 1024;
                     rmsg.status = EXIT_OUT_OF_MEMORY;
 
@@ -723,7 +690,6 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                     struct timeval endtv;
                     gettimeofday(&endtv, 0);
                     rmsg.status = shell_exit_status(status);
-                    rmsg.have_dwo_file = j.dwarfFissionEnabled();
                     job_stat[JobStatistics::exit_code] = shell_exit_status(status);
                     job_stat[JobStatistics::real_msec] = ((endtv.tv_sec - starttv.tv_sec) * 1000)
                                                          + ((long(endtv.tv_usec) - long(starttv.tv_usec)) / 1000);

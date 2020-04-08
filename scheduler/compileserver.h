@@ -57,8 +57,9 @@ public:
 
     bool check_remote(const Job *job) const;
     bool platforms_compatible(const string &target) const;
-    string can_install(const Job *job);
-    bool is_eligible(const Job *job);
+    string can_install(const Job *job, bool ignore_installing = false) const;
+    bool is_eligible_ever(const Job *job) const;
+    bool is_eligible_now(const Job *job) const;
 
     unsigned int remotePort() const;
     void setRemotePort(const unsigned int port);
@@ -82,6 +83,7 @@ public:
 
     int maxJobs() const;
     void setMaxJobs(const int jobs);
+    int maxPreloadCount() const;
 
     bool noRemote() const;
     void setNoRemote(const bool value);
@@ -99,6 +101,10 @@ public:
 
     bool chrootPossible() const;
     void setChrootPossible(const bool possible);
+
+    bool featuresSupported(unsigned int features) const;
+    unsigned int supportedFeatures() const;
+    void setSupportedFeatures(unsigned int features);
 
     int clientCount() const;
     void setClientCount( int clientCount );
@@ -130,8 +136,8 @@ public:
     void insertClientJobId(const int localJobId, const int newJobId);
     void eraseClientJobId(const int localJobId);
 
-    map<CompileServer *, Environments> blacklist() const;
-    Environments getEnvsForBlacklistedCS(CompileServer *cs);
+    map<const CompileServer *, Environments> blacklist() const;
+    Environments getEnvsForBlacklistedCS(const CompileServer *cs);
     void blacklistCompileServer(CompileServer *cs, const std::pair<std::string, std::string> &env);
     void eraseCSFromBlacklist(CompileServer *cs);
 
@@ -144,7 +150,7 @@ public:
     void updateInConnectivity(bool acceptingIn);
 
 private:
-    bool blacklisted(const Job *job, const pair<string, string> &environment);
+    bool blacklisted(const Job *job, const pair<string, string> &environment) const;
 
     /* The listener port, on which it takes compile requests.  */
     unsigned int m_remotePort;
@@ -161,6 +167,7 @@ private:
     State m_state;
     Type m_type;
     bool m_chrootPossible;
+    unsigned int m_featuresSupported;
     int m_clientCount; // number of client connections the daemon has
     int m_submittedJobsCount;
     unsigned int m_lastPickId;
@@ -174,7 +181,7 @@ private:
 
     static unsigned int s_hostIdCounter;
     map<int, int> m_clientMap; // map client ID for daemon to our IDs
-    map<CompileServer *, Environments> m_blacklist;
+    map<const CompileServer *, Environments> m_blacklist;
 
     int m_inFd;
     unsigned int m_inConnAttempt;

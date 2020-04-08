@@ -22,7 +22,7 @@
     51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 */
 
-#include <config.h>
+#include "config.h"
 
 #include <signal.h>
 #include <sys/types.h>
@@ -30,10 +30,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <arpa/inet.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#if HAVE_NETINET_TCP_VAR_H
+#ifdef HAVE_NETINET_TCP_VAR_H
 #include <sys/socketvar.h>
 #include <netinet/tcp_var.h>
 #endif
@@ -46,6 +46,7 @@
 #include <iostream>
 #include <assert.h>
 #include <lzo/lzo1x.h>
+#include <zstd.h>
 #include <stdio.h>
 #ifdef HAVE_LIBCAP_NG
 #include <cap-ng.h>
@@ -59,6 +60,28 @@
 #include "comm.h"
 
 using namespace std;
+
+// Prefer least amount of CPU use
+#undef ZSTD_CLEVEL_DEFAULT
+#define ZSTD_CLEVEL_DEFAULT 1
+
+// old libzstd?
+#ifndef ZSTD_COMPRESSBOUND
+#define ZSTD_COMPRESSBOUND(n) ZSTD_compressBound(n)
+#endif
+
+static int zstd_compression()
+{
+    const char *level = getenv("ICECC_COMPRESSION");
+    if (!level || !*level)
+        return ZSTD_CLEVEL_DEFAULT;
+
+    char *endptr;
+    int n = strtol(level, &endptr, 0);
+    if (*endptr)
+        return ZSTD_CLEVEL_DEFAULT;
+    return n;
+}
 
 /*
  * A generic DoS protection. The biggest messages are of type FileChunk
@@ -75,12 +98,12 @@ using namespace std;
  * once. We can avoid this situation to a large extend by sending smaller
  * chunks of data over.
  */
-#define MAX_WRITE_SIZE 10 * 1024
+#define MAX_SLOW_WRITE_SIZE 10 * 1024
 
 /* TODO
  * buffered in/output per MsgChannel
     + move read* into MsgChannel, create buffer-fill function
-    + add timeouting select() there, handle it in the different
+    + add timeouting poll() there, handle it in the different
     + read* functions.
     + write* unbuffered / or per message buffer (flush in send_msg)
  * think about error handling
@@ -119,7 +142,7 @@ bool MsgChannel::read_a_bit()
             continue;
         } else if (ret < 0) {
             // EOF or some error
-            if (errno != EAGAIN) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 error = true;
             }
         } else if (ret == 0) {
@@ -174,6 +197,8 @@ bool MsgChannel::update_state(void)
                     set_error();
                     return false;
                 }
+
+                maximum_remote_protocol = remote_prot;
 
                 if (remote_prot > PROTOCOL_VERSION) {
                     remote_prot = PROTOCOL_VERSION;    // ours is smaller
@@ -314,40 +339,49 @@ void MsgChannel::writefull(const void *_buf, size_t count)
     msgtogo += count;
 }
 
+static size_t get_max_write_size()
+{
+    if( const char* icecc_slow_network = getenv( "ICECC_SLOW_NETWORK" ))
+        if( icecc_slow_network[ 0 ] == '1' )
+            return MAX_SLOW_WRITE_SIZE;
+    return MAX_MSG_SIZE;
+}
+
 bool MsgChannel::flush_writebuf(bool blocking)
 {
     const char *buf = msgbuf + msgofs;
     bool error = false;
 
     while (msgtogo) {
+        int send_errno;
+        static size_t max_write_size = get_max_write_size();
 #ifdef MSG_NOSIGNAL
-        ssize_t ret = send(fd, buf, msgtogo < MAX_WRITE_SIZE ? msgtogo : MAX_WRITE_SIZE, MSG_NOSIGNAL);
+        ssize_t ret = send(fd, buf, min( msgtogo, max_write_size ), MSG_NOSIGNAL);
+        send_errno = errno;
 #else
         void (*oldsigpipe)(int);
 
         oldsigpipe = signal(SIGPIPE, SIG_IGN);
-        ssize_t ret = send(fd, buf, msgtogo < MAX_WRITE_SIZE ? msgtogo : MAX_WRITE_SIZE, 0);
+        ssize_t ret = send(fd, buf, min( msgtogo, max_write_size ), 0);
+        send_errno = errno;
         signal(SIGPIPE, oldsigpipe);
 #endif
 
         if (ret < 0) {
-            if (errno == EINTR) {
+            if (send_errno == EINTR) {
                 continue;
             }
 
             /* If we want to write blocking, but couldn't write anything,
                select on the fd.  */
-            if (blocking && ( errno == EAGAIN || errno == ENOTCONN )) {
+            if (blocking && ( send_errno == EAGAIN || send_errno == ENOTCONN || send_errno == EWOULDBLOCK )) {
                 int ready;
 
                 for (;;) {
-                    fd_set write_set;
-                    FD_ZERO(&write_set);
-                    FD_SET(fd, &write_set);
-                    struct timeval tv;
-                    tv.tv_sec = 20;
-                    tv.tv_usec = 0;
-                    ready = select(fd + 1, NULL, &write_set, NULL, &tv);
+                    pollfd pfd;
+                    pfd.fd = fd;
+                    pfd.events = POLLOUT;
+                    ready = poll(&pfd, 1, 30 * 1000);
 
                     if (ready < 0 && errno == EINTR) {
                         continue;
@@ -360,10 +394,14 @@ bool MsgChannel::flush_writebuf(bool blocking)
                 if (ready > 0) {
                     continue;
                 }
+                if (ready == 0) {
+                    log_error() << "timed out while trying to send data" << endl;
+                }
 
                 /* Timeout or real error --> error.  */
             }
 
+            errno = send_errno;
             log_perror("flush_writebuf() failed");
             error = true;
             break;
@@ -505,6 +543,19 @@ void MsgChannel::readcompressed(unsigned char **uncompressed_buf, size_t &_uclen
     *this >> tmp;
     compressed_len = tmp;
 
+    uint32_t proto = C_LZO;
+    if (IS_PROTOCOL_40(this)) {
+        *this >> proto;
+        if (proto != C_LZO && proto != C_ZSTD) {
+            log_error() << "Unknown compression protocol " << proto << endl;
+            *uncompressed_buf = 0;
+            _uclen = 0;
+            _clen = compressed_len;
+            set_error();
+            return;
+        }
+    }
+
     /* If there was some input, but nothing compressed,
        or lengths are bigger than the whole chunk message
        or we don't have everything to uncompress, there was an error.  */
@@ -523,7 +574,18 @@ void MsgChannel::readcompressed(unsigned char **uncompressed_buf, size_t &_uclen
 
     *uncompressed_buf = new unsigned char[uncompressed_len];
 
-    if (uncompressed_len && compressed_len) {
+    if (proto == C_ZSTD && uncompressed_len && compressed_len) {
+        const void *compressed_buf = inbuf + intogo;
+        size_t ret = ZSTD_decompress(*uncompressed_buf, uncompressed_len,
+                                     compressed_buf, compressed_len);
+        if (ZSTD_isError(ret)) {
+            log_error() << "internal error - decompression of data from " << dump().c_str()
+                        << " failed: " << ZSTD_getErrorName(ret) << endl;
+            delete[] *uncompressed_buf;
+            *uncompressed_buf = 0;
+            uncompressed_len = 0;
+        }
+    } else if (proto == C_LZO && uncompressed_len && compressed_len) {
         const lzo_byte *compressed_buf = (lzo_byte *)(inbuf + intogo);
         lzo_voidp wrkmem = (lzo_voidp) malloc(LZO1X_MEM_COMPRESS);
         int ret = lzo1x_decompress(compressed_buf, compressed_len,
@@ -553,12 +615,22 @@ void MsgChannel::readcompressed(unsigned char **uncompressed_buf, size_t &_uclen
 
 void MsgChannel::writecompressed(const unsigned char *in_buf, size_t _in_len, size_t &_out_len)
 {
+    uint32_t proto = C_LZO;
+    if (IS_PROTOCOL_40(this))
+        proto = C_ZSTD;
+
     lzo_uint in_len = _in_len;
     lzo_uint out_len = _out_len;
-    out_len = in_len + in_len / 64 + 16 + 3;
+    if (proto == C_LZO)
+        out_len = in_len + in_len / 64 + 16 + 3;
+    else if (proto == C_ZSTD)
+        out_len = ZSTD_COMPRESSBOUND(in_len);
     *this << in_len;
     size_t msgtogo_old = msgtogo;
     *this << (uint32_t) 0;
+
+    if (IS_PROTOCOL_40(this))
+        *this << proto;
 
     if (msgtogo + out_len >= msgbuflen) {
         /* Realloc to a multiple of 128.  */
@@ -567,15 +639,27 @@ void MsgChannel::writecompressed(const unsigned char *in_buf, size_t _in_len, si
         assert(msgbuf); // Probably unrecoverable if realloc fails anyway.
     }
 
-    lzo_byte *out_buf = (lzo_byte *)(msgbuf + msgtogo);
-    lzo_voidp wrkmem = (lzo_voidp) malloc(LZO1X_MEM_COMPRESS);
-    int ret = lzo1x_1_compress(in_buf, in_len, out_buf, &out_len, wrkmem);
-    free(wrkmem);
+    if (proto == C_LZO) {
+        lzo_byte *out_buf = (lzo_byte *)(msgbuf + msgtogo);
+        lzo_voidp wrkmem = (lzo_voidp) malloc(LZO1X_MEM_COMPRESS);
+        int ret = lzo1x_1_compress(in_buf, in_len, out_buf, &out_len, wrkmem);
+        free(wrkmem);
 
-    if (ret != LZO_E_OK) {
-        /* this should NEVER happen */
-        log_error() << "internal error - compression failed: " << ret << endl;
-        out_len = 0;
+        if (ret != LZO_E_OK) {
+            /* this should NEVER happen */
+            log_error() << "internal error - compression failed: " << ret << endl;
+            out_len = 0;
+        }
+    } else if (proto == C_ZSTD) {
+        void *out_buf = msgbuf + msgtogo;
+        size_t ret = ZSTD_compress(out_buf, out_len, in_buf, in_len, zstd_compression());
+        if (ZSTD_isError(ret)) {
+            /* this should NEVER happen */
+            log_error() << "internal error - compression failed: " << ZSTD_getErrorName(ret) << endl;
+            out_len = 0;
+        }
+
+        out_len = ret;
     }
 
     uint32_t _olen = htonl(out_len);
@@ -618,8 +702,17 @@ void MsgChannel::set_error(bool silent)
     if( instate == ERROR ) {
         return;
     }
-    if( !silent ) {
+    if( !silent && !set_error_recursion ) {
         trace() << "setting error state for channel " << dump() << endl;
+        // After the state is set to error, get_msg() will not return anything anymore,
+        // so try to fetch last status from the other side, if available.
+        set_error_recursion = true;
+        Msg* msg = get_msg( 2, true );
+        if (msg && msg->type == M_STATUS_TEXT) {
+            log_error() << "remote status: "
+                << static_cast<StatusTextMsg*>(msg)->text << endl;
+        }
+        set_error_recursion = false;
     }
     instate = ERROR;
     eof = true;
@@ -639,7 +732,7 @@ static int prepare_connect(const string &hostname, unsigned short p,
     struct hostent *host = gethostbyname(hostname.c_str());
 
     if (!host) {
-        log_perror("Unknown host");
+        log_error() << "Connecting to " << hostname << " failed: " << hstrerror( h_errno ) << endl;
         if ((-1 == close(remote_fd)) && (errno != EBADF)){
             log_perror("close failed");
         }
@@ -672,19 +765,15 @@ static bool connect_async(int remote_fd, struct sockaddr *remote_addr, size_t re
     int status = connect(remote_fd, remote_addr, remote_size);
 
     if ((status < 0) && (errno == EINPROGRESS || errno == EAGAIN)) {
-        struct timeval select_timeout;
-        fd_set writefds;
+        pollfd pfd;
+        pfd.fd = remote_fd;
+        pfd.events = POLLOUT;
         int ret;
 
         do {
-            /* we select for a specific time and if that succeeds, we connect one
+            /* we poll for a specific time and if that succeeds, we connect one
                final time. Everything else we ignore */
-
-            select_timeout.tv_sec = timeout;
-            select_timeout.tv_usec = 0;
-            FD_ZERO(&writefds);
-            FD_SET(remote_fd, &writefds);
-            ret = select(remote_fd + 1, NULL, &writefds, NULL, &select_timeout);
+            ret = poll(&pfd, 1, timeout * 1000);
 
             if (ret < 0 && errno == EINTR) {
                 continue;
@@ -771,7 +860,7 @@ MsgChannel *Service::createChannel(const string &socket_path)
     strncpy(remote_addr.sun_path, socket_path.c_str(), sizeof(remote_addr.sun_path) - 1);
     remote_addr.sun_path[sizeof(remote_addr.sun_path) - 1] = '\0';
     if(socket_path.length() > sizeof(remote_addr.sun_path) - 1) {
-        log_error() << "socket_path path too long for sun_path" << endl;		
+        log_error() << "socket_path path too long for sun_path" << endl;
     }
 
     if (connect(remote_fd, (struct sockaddr *) &remote_addr, sizeof(remote_addr)) < 0) {
@@ -825,7 +914,7 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     : fd(_fd)
 {
     addr_len = (sizeof(struct sockaddr) > _l) ? sizeof(struct sockaddr) : _l;
- 
+
     if (addr_len && _a) {
         addr = (struct sockaddr *)malloc(addr_len);
         memcpy(addr, _a, _l);
@@ -853,8 +942,11 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     intogo = 0;
     eof = false;
     text_based = text;
+    set_error_recursion = false;
+    maximum_remote_protocol = -1;
 
     int on = 1;
+    int sec;
 
     if (!setsockopt(_fd, SOL_SOCKET, SO_KEEPALIVE, (char *) &on, sizeof(on))) {
 #if defined( TCP_KEEPIDLE ) || defined( TCPCTL_KEEPIDLE )
@@ -864,7 +956,6 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
         int keepidle = TCPCTL_KEEPIDLE;
 #endif
 
-        int sec;
         sec = MAX_SCHEDULER_PING - 3 * MAX_SCHEDULER_PONG;
         setsockopt(_fd, IPPROTO_TCP, keepidle, (char *) &sec, sizeof(sec));
 #endif
@@ -951,20 +1042,17 @@ bool MsgChannel::wait_for_protocol()
     }
 
     while (instate == NEED_PROTO) {
-        fd_set set;
-        FD_ZERO(&set);
-        FD_SET(fd, &set);
-        struct timeval tv;
-        tv.tv_sec = 5;
-        tv.tv_usec = 0;
-        int ret = select(fd + 1, &set, NULL, NULL, &tv);
+        pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        int ret = poll(&pfd, 1, 15 * 1000); // 15s
 
         if (ret < 0 && errno == EINTR) {
             continue;
         }
 
         if (ret == 0) {
-            log_error() << "no response within timeout" << endl;
+            log_warning() << "no response within timeout" << endl;
             set_error();
             return false; /* timeout. Consider it a fatal error. */
         }
@@ -1025,14 +1113,11 @@ bool MsgChannel::wait_for_msg(int timeout)
     }
 
     while (!has_msg()) {
-        fd_set read_set;
-        FD_ZERO(&read_set);
-        FD_SET(fd, &read_set);
-        struct timeval tv;
-        tv.tv_sec = timeout;
-        tv.tv_usec = 0;
+        pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
 
-        if (select(fd + 1, &read_set, NULL, NULL, &tv) <= 0) {
+        if (poll(&pfd, 1, timeout * 1000) <= 0) {
             if (errno == EINTR) {
                 continue;
             }
@@ -1284,7 +1369,8 @@ void Broadcasts::broadcastSchedulerVersion(int scheduler_port, const char* netna
     uint64_t tmp_time = starttime;
     memcpy(buf + 4, &tmp_time, sizeof(uint64_t));
     buf[4 + sizeof(uint64_t)] = length_netname;
-    strncpy(buf + 5 + sizeof(uint64_t), netname, length_netname);
+    strncpy(buf + 5 + sizeof(uint64_t), netname, length_netname - 1);
+    buf[ schedbuflen - 1 ] = '\0';
     broadcastData(scheduler_port, buf, schedbuflen);
     delete[] buf;
     // Latest version.
@@ -1387,17 +1473,17 @@ static int open_send_broadcast(int port, const char* buf, int size)
         static bool in_tests = getenv( "ICECC_TESTS" ) != NULL;
         if (!in_tests) {
             if (ntohl(((struct sockaddr_in *) addr->ifa_addr)->sin_addr.s_addr) == 0x7f000001) {
-                trace() << "ignoring localhost " << addr->ifa_name << endl;
+                trace() << "ignoring localhost " << addr->ifa_name << " for broadcast" << endl;
                 continue;
             }
 
             if ((addr->ifa_flags & IFF_POINTOPOINT) || !(addr->ifa_flags & IFF_BROADCAST)) {
-                log_info() << "ignoring tunnels " << addr->ifa_name << endl;
+                log_info() << "ignoring tunnels " << addr->ifa_name << " for broadcast" << endl;
                 continue;
             }
         } else {
             if (ntohl(((struct sockaddr_in *) addr->ifa_addr)->sin_addr.s_addr) != 0x7f000001) {
-                trace() << "ignoring non-localhost " << addr->ifa_name << endl;
+                trace() << "ignoring non-localhost " << addr->ifa_name << " for broadcast" << endl;
                 continue;
             }
         }
@@ -1748,16 +1834,13 @@ bool DiscoverSched::get_broad_answer(int ask_fd, int timeout, char *buf2, struct
                  socklen_t *remote_len)
 {
     char buf = PROTOCOL_VERSION;
-    fd_set read_set;
-    FD_ZERO(&read_set);
+    pollfd pfd;
     assert(ask_fd > 0);
-    FD_SET(ask_fd, &read_set);
-    struct timeval tv;
-    tv.tv_sec = timeout / 1000;
-    tv.tv_usec = 1000 * (timeout % 1000);
+    pfd.fd = ask_fd;
+    pfd.events = POLLIN;
     errno = 0;
 
-    if (select(ask_fd + 1, &read_set, NULL, NULL, &tv) <= 0) {
+    if (poll(&pfd, 1, timeout) <= 0 || (pfd.revents & POLLIN) == 0) {
         /* Normally this is a timeout, i.e. no scheduler there.  */
         if (errno && errno != EINTR) {
             log_perror("waiting for scheduler");
@@ -1839,6 +1922,30 @@ void Msg::send_to_channel(MsgChannel *c) const
     *c << (uint32_t) type;
 }
 
+GetCSMsg::GetCSMsg(const Environments &envs, const std::string &f,
+     CompileJob::Language _lang, unsigned int _count,
+     std::string _target, unsigned int _arg_flags,
+     const std::string &host, int _minimal_host_version,
+     unsigned int _required_features,
+     unsigned int _client_count)
+    : Msg(M_GET_CS)
+    , versions(envs)
+    , filename(f)
+    , lang(_lang)
+    , count(_count)
+    , target(_target)
+    , arg_flags(_arg_flags)
+    , client_id(0)
+    , preferred_host(host)
+    , minimal_host_version(_minimal_host_version)
+    , required_features(_required_features)
+    , client_count(_client_count)
+{
+    // These have been introduced in protocol version 42.
+    if( required_features & ( NODE_FEATURE_ENV_XZ | NODE_FEATURE_ENV_ZSTD ))
+        minimal_host_version = max( minimal_host_version, 42 );
+}
+
 void GetCSMsg::fill_from_channel(MsgChannel *c)
 {
     Msg::fill_from_channel(c);
@@ -1875,6 +1982,11 @@ void GetCSMsg::fill_from_channel(MsgChannel *c)
     if (IS_PROTOCOL_39(c)) {
         *c >> client_count;
     }
+
+    required_features = 0;
+    if (IS_PROTOCOL_42(c)) {
+        *c >> required_features;
+    }
 }
 
 void GetCSMsg::send_to_channel(MsgChannel *c) const
@@ -1901,6 +2013,9 @@ void GetCSMsg::send_to_channel(MsgChannel *c) const
 
     if (IS_PROTOCOL_39(c)) {
         *c << client_count;
+    }
+    if (IS_PROTOCOL_42(c)) {
+        *c << required_features;
     }
 }
 
@@ -1955,24 +2070,29 @@ void CompileFileMsg::fill_from_channel(MsgChannel *c)
 {
     Msg::fill_from_channel(c);
     uint32_t id, lang;
-    list<string> _l1, _l2;
     string version;
     *c >> lang;
     *c >> id;
-    *c >> _l1;
-    *c >> _l2;
+    ArgumentsList l;
+    if( IS_PROTOCOL_41(c)) {
+        list<string> largs;
+        *c >> largs;
+        // Whe compiling remotely, we no longer care about the Arg_Remote vs Arg_Rest
+        // difference, so treat them all as Arg_Remote.
+        for (list<string>::const_iterator it = largs.begin(); it != largs.end(); ++it)
+            l.append(*it, Arg_Remote);
+    } else {
+        list<string> _l1, _l2;
+        *c >> _l1;
+        *c >> _l2;
+        for (list<string>::const_iterator it = _l1.begin(); it != _l1.end(); ++it)
+            l.append(*it, Arg_Remote);
+        for (list<string>::const_iterator it = _l2.begin(); it != _l2.end(); ++it)
+            l.append(*it, Arg_Rest);
+    }
     *c >> version;
     job->setLanguage((CompileJob::Language) lang);
     job->setJobID(id);
-    ArgumentsList l;
-
-    for (list<string>::const_iterator it = _l1.begin(); it != _l1.end(); ++it) {
-        l.append(*it, Arg_Remote);
-    }
-
-    for (list<string>::const_iterator it = _l2.begin(); it != _l2.end(); ++it) {
-        l.append(*it, Arg_Rest);
-    }
 
     job->setFlags(l);
     job->setEnvironmentVersion(version);
@@ -2010,20 +2130,27 @@ void CompileFileMsg::send_to_channel(MsgChannel *c) const
     *c << (uint32_t) job->language();
     *c << job->jobID();
 
-    if (IS_PROTOCOL_30(c)) {
-        *c << job->remoteFlags();
+    if (IS_PROTOCOL_41(c)) {
+        // By the time we're compiling, the args are all Arg_Remote or Arg_Rest and
+        // we no longer care about the differences, but we may care about the ordering.
+        // So keep them all in one list.
+        *c << job->nonLocalFlags();
     } else {
-        if (job->compilerName().find("clang") != string::npos) {
-            // Hack for compilerwrapper.
-            std::list<std::string> flags = job->remoteFlags();
-            flags.push_front("clang");
-            *c << flags;
-        } else {
+        if (IS_PROTOCOL_30(c)) {
             *c << job->remoteFlags();
+        } else {
+            if (job->compilerName().find("clang") != string::npos) {
+                // Hack for compilerwrapper.
+                std::list<std::string> flags = job->remoteFlags();
+                flags.push_front("clang");
+                *c << flags;
+            } else {
+                *c << job->remoteFlags();
+            }
         }
+        *c << job->restFlags();
     }
 
-    *c << job->restFlags();
     *c << job->environmentVersion();
     *c << job->targetPlatform();
 
@@ -2250,7 +2377,8 @@ void JobDoneMsg::set_job_id( uint32_t jobId )
     flags &= ~ (uint32_t) UnknownJobId;
 }
 
-LoginMsg::LoginMsg(unsigned int myport, const std::string &_nodename, const std::string &_host_platform)
+LoginMsg::LoginMsg(unsigned int myport, const std::string &_nodename, const std::string &_host_platform,
+    unsigned int myfeatures)
     : Msg(M_LOGIN)
     , port(myport)
     , max_kids(0)
@@ -2258,6 +2386,7 @@ LoginMsg::LoginMsg(unsigned int myport, const std::string &_nodename, const std:
     , chroot_possible(false)
     , nodename(_nodename)
     , host_platform(_host_platform)
+    , supported_features(myfeatures)
 {
 #ifdef HAVE_LIBCAP_NG
     chroot_possible = capng_have_capability(CAPNG_EFFECTIVE, CAP_SYS_CHROOT);
@@ -2285,6 +2414,11 @@ void LoginMsg::fill_from_channel(MsgChannel *c)
     }
 
     noremote = (net_noremote != 0);
+
+    supported_features = 0;
+    if (IS_PROTOCOL_42(c)) {
+        *c >> supported_features;
+    }
 }
 
 void LoginMsg::send_to_channel(MsgChannel *c) const
@@ -2299,6 +2433,9 @@ void LoginMsg::send_to_channel(MsgChannel *c) const
 
     if (IS_PROTOCOL_26(c)) {
         *c << noremote;
+    }
+    if (IS_PROTOCOL_42(c)) {
+        *c << supported_features;
     }
 }
 
@@ -2348,6 +2485,9 @@ void GetNativeEnvMsg::fill_from_channel(MsgChannel *c)
         *c >> compiler;
         *c >> extrafiles;
     }
+    compression = string();
+    if (IS_PROTOCOL_42(c))
+        *c >> compression;
 }
 
 void GetNativeEnvMsg::send_to_channel(MsgChannel *c) const
@@ -2358,6 +2498,8 @@ void GetNativeEnvMsg::send_to_channel(MsgChannel *c) const
         *c << compiler;
         *c << extrafiles;
     }
+    if (IS_PROTOCOL_42(c))
+        *c << compression;
 }
 
 void UseNativeEnvMsg::fill_from_channel(MsgChannel *c)

@@ -31,7 +31,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/signal.h>
 #include <unistd.h>
 #include <errno.h>
@@ -50,6 +50,7 @@
 #include <stdio.h>
 #include <pwd.h>
 #include "../services/comm.h"
+#include "../services/getifaddrs.h"
 #include "../services/logging.h"
 #include "../services/job.h"
 #include "../services/util.h"
@@ -57,9 +58,7 @@
 
 #include "compileserver.h"
 #include "job.h"
-
-// Values 0 to 3.
-#define DEBUG_SCHEDULER 0
+#include "scheduler.h"
 
 /* TODO:
    * leak check
@@ -100,6 +99,7 @@ static volatile sig_atomic_t exit_main_loop = false;
 
 time_t starttime;
 time_t last_announce;
+static string scheduler_interface = "";
 static unsigned int scheduler_port = 8765;
 
 // A subset of connected_hosts representing the compiler servers
@@ -114,7 +114,7 @@ static map<unsigned int, Job *> jobs;
    to delete anything out of them (for clean up).  */
 struct UnansweredList {
     list<Job *> l;
-    CompileServer *server;
+    CompileServer *submitter;
     bool remove_job(Job *);
 };
 static list<UnansweredList *> toanswer;
@@ -340,6 +340,10 @@ static void handle_monitor_stats(CompileServer *cs, StatsMsg *m = 0)
     msg += buffer;
     sprintf(buffer, "Platform:%s\n", cs->hostPlatform().c_str());
     msg += buffer;
+    sprintf(buffer, "Version:%d\n", cs->maximum_remote_protocol);
+    msg += buffer;
+    sprintf(buffer, "Features:%s\n", supported_features_to_string(cs->supportedFeatures()).c_str());
+    msg += buffer;
     sprintf(buffer, "Speed:%f\n", server_speed(cs));
     msg += buffer;
 
@@ -374,11 +378,11 @@ static Job *create_new_job(CompileServer *submitter)
 
 static void enqueue_job_request(Job *job)
 {
-    if (!toanswer.empty() && toanswer.back()->server == job->submitter()) {
+    if (!toanswer.empty() && toanswer.back()->submitter == job->submitter()) {
         toanswer.back()->l.push_back(job);
     } else {
         UnansweredList *newone = new UnansweredList();
-        newone->server = job->submitter();
+        newone->submitter = job->submitter();
         newone->l.push_back(job);
         toanswer.push_back(newone);
     }
@@ -458,6 +462,7 @@ static bool handle_cs_request(MsgChannel *cs, Msg *_m)
         job->setLocalClientId(m->client_id);
         job->setPreferredHost(m->preferred_host);
         job->setMinimalHostVersion(m->minimal_host_version);
+        job->setRequiredFeatures(m->required_features);
         enqueue_job_request(job);
         std::ostream &dbg = log_info();
         dbg << "NEW " << job->id() << " client="
@@ -587,7 +592,10 @@ static CompileServer *pick_server(Job *job)
     /* if the user wants to test/prefer one specific daemon, we look for that one first */
     if (!job->preferredHost().empty()) {
         for (list<CompileServer *>::iterator it = css.begin(); it != css.end(); ++it) {
-            if ((*it)->matches(job->preferredHost()) && (*it)->is_eligible(job)) {
+            if ((*it)->matches(job->preferredHost()) && (*it)->is_eligible_now(job)) {
+#if DEBUG_SCHEDULER > 1
+                trace() << "taking preferred " << (*it)->nodeName() << " " <<  server_speed(*it, job, true) << endl;
+#endif
                 return *it;
             }
         }
@@ -601,7 +609,7 @@ static CompileServer *pick_server(Job *job)
         int eligible_count = 0;
 
         for (list<CompileServer *>::iterator it = css.begin(); it != css.end(); ++it) {
-            if ((*it)->is_eligible( job )) {
+            if ((*it)->is_eligible_now( job )) {
                 ++eligible_count;
                 // Do not select the first one (which could be broken and so we might never get job stats),
                 // but rather select randomly.
@@ -629,19 +637,15 @@ static CompileServer *pick_server(Job *job)
     for (list<CompileServer *>::iterator it = css.begin(); it != css.end(); ++it) {
         CompileServer *cs = *it;
 
-        /* For now ignore overloaded servers.  */
-        /* Pre-loadable (cs->jobList().size()) == (cs->maxJobs()) is checked later.  */
-        if ((int(cs->jobList().size()) > cs->maxJobs()) || (cs->load() >= 1000)) {
-#if DEBUG_SCHEDULER > 1
-            trace() << "overloaded " << cs->nodeName() << " " << cs->jobList().size() << "/"
-                    <<  cs->maxJobs() << " jobs, load:" << cs->load() << endl;
-#endif
-            continue;
-        }
-
         // Ignore ineligible servers
-        if (!cs->is_eligible(job)) {
-            trace() << cs->nodeName() << " not eligible" << endl;
+        if (!cs->is_eligible_now(job)) {
+#if DEBUG_SCHEDULER > 1
+            if ((int(cs->jobList().size()) >= cs->maxJobs() + c->maxPreloadJobs()) || (cs->load() >= 1000)) {
+                trace() << "overloaded " << cs->nodeName() << " " << cs->jobList().size() << "/"
+                        <<  cs->maxJobs() << " jobs, load:" << cs->load() << endl;
+            else
+                trace() << cs->nodeName() << " not eligible" << endl;
+#endif
             continue;
         }
 
@@ -746,7 +750,7 @@ static CompileServer *pick_server(Job *job)
 
     if (bestpre) {
 #if DEBUG_SCHEDULER > 1
-        trace() << "taking best preload " << bestui->nodeName() << " " <<  server_speed(bestui, job, true) << endl;
+        trace() << "taking best preload " << bestpre->nodeName() << " " <<  server_speed(bestpre, job, true) << endl;
 #endif
     }
 
@@ -884,8 +888,20 @@ static bool empty_queue()
             job = delay_current_job();
 
             if ((job == first_job) || !job) { // no job found in the whole toanswer list
-                trace() << "No suitable host found, delaying" << endl;
-                return false;
+                job = first_job;
+                for (list<CompileServer *>::iterator it = css.begin(); it != css.end(); ++it) {
+                    if(!job->preferredHost().empty() && !(*it)->matches(job->preferredHost()))
+                        continue;
+                    if((*it)->is_eligible_ever(job)) {
+                        trace() << "No suitable host found, delaying" << endl;
+                        return false;
+                    }
+                }
+                // This means that there's nobody who could possibly handle the job,
+                // so there's no point in delaying.
+                log_info() << "No suitable host found, assigning submitter" << endl;
+                cs = job->submitter();
+                break;
             }
         } else {
             break;
@@ -1012,6 +1028,7 @@ static bool handle_login(CompileServer *cs, Msg *_m)
 
     cs->setHostPlatform(m->host_platform);
     cs->setChrootPossible(m->chroot_possible);
+    cs->setSupportedFeatures(m->supported_features);
     cs->pick_new_id();
 
     for (list<string>::const_iterator it = block_css.begin(); it != block_css.end(); ++it)
@@ -1019,16 +1036,13 @@ static bool handle_login(CompileServer *cs, Msg *_m)
             return false;
         }
 
-    dbg << "login " << m->nodename << " protocol version: " << cs->protocol;
-#if 1
-    dbg << " [";
-
+    dbg << "login " << m->nodename << " protocol version: " << cs->protocol
+        << " features: " << supported_features_to_string(m->supported_features)
+        << " [";
     for (Environments::const_iterator it = m->envs.begin(); it != m->envs.end(); ++it) {
         dbg << it->second << "(" << it->first << "), ";
     }
-
     dbg << "]" << endl;
-#endif
 
     handle_monitor_stats(cs);
 
@@ -1171,7 +1185,7 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
                 list<UnansweredList *>::iterator it;
 
                 for (it = toanswer.begin(); it != toanswer.end(); ++it)
-                    if ((*it)->server == cs) {
+                    if ((*it)->submitter == cs) {
                         UnansweredList *l = *it;
                         list<Job *>::iterator jit;
 
@@ -1284,7 +1298,7 @@ static bool handle_stats(CompileServer *cs, Msg *_m)
     if (!IS_PROTOCOL_25(cs)) {
         cs->last_talk = time(0);
 
-        if (cs && (cs->maxJobs() < 0)) {
+        if (cs->maxJobs() < 0) {
             cs->setMaxJobs(cs->maxJobs() * -1);
         }
     }
@@ -1418,10 +1432,10 @@ static bool handle_line(CompileServer *cs, Msg *_m)
     if (cmd == "listcs") {
         for (list<CompileServer *>::iterator it = css.begin(); it != css.end(); ++it) {
             char buffer[1000];
-            sprintf(buffer, " (%s:%d) ", (*it)->name.c_str(), (*it)->remotePort());
+            sprintf(buffer, " (%s:%u) ", (*it)->name.c_str(), (*it)->remotePort());
             line = " " + (*it)->nodeName() + buffer;
             line += "[" + (*it)->hostPlatform() + "] speed=";
-            sprintf(buffer, "%.2f jobs=%d/%d load=%d", server_speed(*it),
+            sprintf(buffer, "%.2f jobs=%d/%d load=%u", server_speed(*it),
                     (int)(*it)->jobList().size(), (*it)->maxJobs(), (*it)->load());
             line += buffer;
 
@@ -1603,7 +1617,7 @@ static bool handle_end(CompileServer *toremove, Msg *m)
            so we need to clean them up also.  */
 
         for (list<UnansweredList *>::iterator it = toanswer.begin(); it != toanswer.end();) {
-            if ((*it)->server == toremove) {
+            if ((*it)->submitter == toremove) {
                 UnansweredList *l = *it;
                 list<Job *>::iterator jit;
 
@@ -1733,7 +1747,7 @@ static bool handle_activity(CompileServer *cs)
     return ret;
 }
 
-static int open_broad_listener(int port)
+static int open_broad_listener(int port, const string &interface)
 {
     int listen_fd;
     struct sockaddr_in myaddr;
@@ -1750,11 +1764,11 @@ static int open_broad_listener(int port)
         return -1;
     }
 
-    myaddr.sin_family = AF_INET;
-    myaddr.sin_port = htons(port);
-    myaddr.sin_addr.s_addr = INADDR_ANY;
+    if (!build_address_for_interface(myaddr, interface, port)) {
+        return -1;
+    }
 
-    if (bind(listen_fd, (struct sockaddr *) &myaddr, sizeof(myaddr)) < 0) {
+    if (::bind(listen_fd, (struct sockaddr *) &myaddr, sizeof(myaddr)) < 0) {
         log_perror("bind()");
         return -1;
     }
@@ -1762,7 +1776,7 @@ static int open_broad_listener(int port)
     return listen_fd;
 }
 
-static int open_tcp_listener(short port)
+static int open_tcp_listener(short port, const string &interface)
 {
     int fd;
     struct sockaddr_in myaddr;
@@ -1779,24 +1793,24 @@ static int open_tcp_listener(short port)
         return -1;
     }
 
-    /* Although we select() on fd we need O_NONBLOCK, due to
-       possible network errors making accept() block although select() said
+    /* Although we poll() on fd we need O_NONBLOCK, due to
+       possible network errors making accept() block although poll() said
        there was some activity.  */
     if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
         log_perror("fcntl()");
         return -1;
     }
 
-    myaddr.sin_family = AF_INET;
-    myaddr.sin_port = htons(port);
-    myaddr.sin_addr.s_addr = INADDR_ANY;
+    if (!build_address_for_interface(myaddr, interface, port)) {
+        return -1;
+    }
 
-    if (bind(fd, (struct sockaddr *) &myaddr, sizeof(myaddr)) < 0) {
+    if (::bind(fd, (struct sockaddr *) &myaddr, sizeof(myaddr)) < 0) {
         log_perror("bind()");
         return -1;
     }
 
-    if (listen(fd, 10) < 0) {
+    if (listen(fd, 1024) < 0) {
         log_perror("listen()");
         return -1;
     }
@@ -1814,6 +1828,7 @@ static void usage(const char *reason = 0)
     cerr << "usage: icecc-scheduler [options] \n"
          << "Options:\n"
          << "  -n, --netname <name>\n"
+         << "  -i, --interface <net_interface>\n"
          << "  -p, --port <port>\n"
          << "  -h, --help\n"
          << "  -l, --log-file <file>\n"
@@ -1916,6 +1931,7 @@ int main(int argc, char *argv[])
             { "netname", 1, NULL, 'n' },
             { "help", 0, NULL, 'h' },
             { "persistent-client-connection", 0, NULL, 'r' },
+            { "interface", 1, NULL, 'i' },
             { "port", 1, NULL, 'p' },
             { "daemonize", 0, NULL, 'd'},
             { "log-file", 1, NULL, 'l'},
@@ -1923,7 +1939,7 @@ int main(int argc, char *argv[])
             { 0, 0, 0, 0 }
         };
 
-        const int c = getopt_long(argc, argv, "n:p:hl:vdru:", long_options, &option_index);
+        const int c = getopt_long(argc, argv, "n:i:p:hl:vdru:", long_options, &option_index);
 
         if (c == -1) {
             break;    // eoo
@@ -1960,6 +1976,20 @@ int main(int argc, char *argv[])
                 netname = optarg;
             } else {
                 usage("Error: -n requires argument");
+            }
+
+            break;
+        case 'i':
+
+            if (optarg && *optarg) {
+                string interface = optarg;
+                if (interface.empty()) {
+                    usage("Error: Invalid network interface specified");
+                }
+
+                scheduler_interface = interface;
+            } else {
+                usage("Error: -i requires argument");
             }
 
             break;
@@ -2051,19 +2081,19 @@ int main(int argc, char *argv[])
         }
     }
 
-    listen_fd = open_tcp_listener(scheduler_port);
+    listen_fd = open_tcp_listener(scheduler_port, scheduler_interface);
 
     if (listen_fd < 0) {
         return 1;
     }
 
-    text_fd = open_tcp_listener(scheduler_port + 1);
+    text_fd = open_tcp_listener(scheduler_port + 1, scheduler_interface);
 
     if (text_fd < 0) {
         return 1;
     }
 
-    broad_fd = open_broad_listener(scheduler_port);
+    broad_fd = open_broad_listener(scheduler_port, scheduler_interface);
 
     if (broad_fd < 0) {
         return 1;
@@ -2080,7 +2110,7 @@ int main(int argc, char *argv[])
 
     ofstream pidFile;
     string progName = argv[0];
-    progName = progName.substr(progName.rfind('/') + 1);
+    progName = find_basename(progName);
     pidFilePath = string(RUNDIR) + string("/") + progName + string(".pid");
     pidFile.open(pidFilePath.c_str());
     pidFile << getpid() << endl;
@@ -2098,9 +2128,7 @@ int main(int argc, char *argv[])
     last_announce = starttime;
 
     while (!exit_main_loop) {
-        struct timeval tv;
-        tv.tv_usec = 0;
-        tv.tv_sec = prune_servers();
+        int timeout = prune_servers();
 
         while (empty_queue()) {
             continue;
@@ -2114,27 +2142,23 @@ int main(int argc, char *argv[])
             last_announce = time(NULL);
         }
 
-        fd_set read_set, write_set;
-        int max_fd = 0;
-        FD_ZERO(&read_set);
-        FD_ZERO(&write_set);
+        vector< pollfd > pollfds;
+        pollfds.reserve( fd2cs.size() + css.size() + 5 );
+        pollfd pfd; // tmp variable
 
         if (time(0) >= next_listen) {
-            max_fd = listen_fd;
-            FD_SET(listen_fd, &read_set);
+            pfd.fd = listen_fd;
+            pfd.events = POLLIN;
+            pollfds.push_back( pfd );
 
-            if (text_fd > max_fd) {
-                max_fd = text_fd;
-            }
-
-            FD_SET(text_fd, &read_set);
+            pfd.fd = text_fd;
+            pfd.events = POLLIN;
+            pollfds.push_back( pfd );
         }
 
-        if (broad_fd > max_fd) {
-            max_fd = broad_fd;
-        }
-
-        FD_SET(broad_fd, &read_set);
+        pfd.fd = broad_fd;
+        pfd.events = POLLIN;
+        pollfds.push_back( pfd );
 
         for (map<int, CompileServer *>::const_iterator it = fd2cs.begin(); it != fd2cs.end();) {
             int i = it->first;
@@ -2151,11 +2175,9 @@ int main(int argc, char *argv[])
             }
 
             if (ok) {
-                if (i > max_fd) {
-                    max_fd = i;
-                }
-
-                FD_SET(i, &read_set);
+                pfd.fd = i;
+                pfd.events = POLLIN;
+                pollfds.push_back( pfd );
             }
         }
 
@@ -2166,16 +2188,14 @@ int main(int argc, char *argv[])
             {
                 int csInFd = (*it)->getInFd();
                 cs_in_tsts.push_back(*it);
-                if(csInFd > max_fd)
-                {
-                    max_fd = csInFd;
-                }
-                FD_SET(csInFd, &read_set);
-                FD_SET(csInFd, &write_set);
+                pfd.fd = csInFd;
+                pfd.events = POLLIN | POLLOUT;
+                pollfds.push_back( pfd );
             }
         }
 
-        int active_fds = select(max_fd + 1, &read_set, &write_set, NULL, &tv);
+        int active_fds = poll(pollfds.data(), pollfds.size(), timeout * 1000);
+        int poll_errno = errno;
 
         if (active_fds < 0 && errno == EINTR) {
             reset_debug_if_needed(); // we possibly got SIGHUP
@@ -2184,11 +2204,12 @@ int main(int argc, char *argv[])
         reset_debug_if_needed();
 
         if (active_fds < 0) {
-            log_perror("select()");
+            errno = poll_errno;
+            log_perror("poll()");
             return 1;
         }
 
-        if (FD_ISSET(listen_fd, &read_set)) {
+        if (pollfd_is_set(pollfds, listen_fd, POLLIN)) {
             active_fds--;
             bool pending_connections = true;
 
@@ -2232,7 +2253,7 @@ int main(int argc, char *argv[])
             next_listen = time(0) + 1;
         }
 
-        if (active_fds && FD_ISSET(text_fd, &read_set)) {
+        if (active_fds && pollfd_is_set(pollfds, text_fd, POLLIN)) {
             active_fds--;
             remote_len = sizeof(remote_addr);
             remote_fd = accept(text_fd,
@@ -2261,7 +2282,7 @@ int main(int argc, char *argv[])
             }
         }
 
-        if (active_fds && FD_ISSET(broad_fd, &read_set)) {
+        if (active_fds && pollfd_is_set(pollfds, broad_fd, POLLIN)) {
             active_fds--;
             char buf[Broadcasts::BROAD_BUFLEN + 1];
             struct sockaddr_in broad_addr;
@@ -2280,7 +2301,7 @@ int main(int argc, char *argv[])
                    even on a blocking socket (breaking POSIX).  Happens
                    when the arriving packet has a wrong checksum.  So
                    we ignore EAGAIN here, but still abort for all other errors. */
-                if (err != EAGAIN) {
+                if (err != EAGAIN && err != EWOULDBLOCK) {
                     return -1;
                 }
             }
@@ -2312,7 +2333,7 @@ int main(int argc, char *argv[])
                invalid.  */
             ++it;
 
-            if (FD_ISSET(i, &read_set)) {
+            if (pollfd_is_set(pollfds, i, POLLIN)) {
                 while (!cs->read_a_bit() || cs->has_msg()) {
                     if (!handle_activity(cs)) {
                         break;
@@ -2330,12 +2351,12 @@ int main(int argc, char *argv[])
             }
             if((*it)->getConnectionInProgress())
             {
-                if(active_fds > 0 && (FD_ISSET((*it)->getInFd(), &read_set) || FD_ISSET((*it)->getInFd(), &write_set)) && (*it)->isConnected())
+                if(active_fds > 0 && pollfd_is_set(pollfds, (*it)->getInFd(), POLLIN | POLLOUT) && (*it)->isConnected())
                 {
                     active_fds--;
                     (*it)->updateInConnectivity(true);
                 }
-                else if((active_fds == 0 || (FD_ISSET((*it)->getInFd(), &read_set) || FD_ISSET((*it)->getInFd(), &write_set))) && !(*it)->isConnected())
+                else if((active_fds == 0 || pollfd_is_set(pollfds, (*it)->getInFd(), POLLIN | POLLOUT)) && !(*it)->isConnected())
                 {
                     (*it)->updateInConnectivity(false);
                 }

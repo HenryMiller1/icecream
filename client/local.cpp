@@ -36,6 +36,7 @@
 
 #include <comm.h>
 #include "client.h"
+#include "pipes.h"
 
 using namespace std;
 
@@ -46,7 +47,7 @@ const char *rs_program_name = "icecc";
 
 static string compiler_path_lookup_helper(const string &compiler, const string &compiler_path)
 {
-    if (compiler_path.find_first_of('/') != string::npos) {
+    if (compiler_path.find('/') != string::npos) {
         return compiler_path;
     }
 
@@ -58,7 +59,7 @@ static string compiler_path_lookup_helper(const string &compiler, const string &
     string best_match;
 
     while (end != string::npos) {
-        end = path.find_first_of(':', begin);
+        end = path.find(':', begin);
         string part;
 
         if (end == string::npos) {
@@ -202,17 +203,13 @@ string clang_get_default_target(const CompileJob &job)
     return read_command_output( find_compiler( job ) + " -dumpmachine" );
 }
 
-static volatile int lock_fd = 0;
 static volatile int user_break_signal = 0;
 static volatile pid_t child_pid;
 
 static void handle_user_break(int sig)
 {
-    if (lock_fd) {
-        dcc_unlock(lock_fd);
-    }
+    dcc_unlock();
 
-    lock_fd = 0;
     user_break_signal = sig;
 
     if (child_pid != 0) {
@@ -251,10 +248,6 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
     arguments.push_back(compiler_name);
     appendList(arguments, job.allFlags());
 
-    if (job.dwarfFissionEnabled()) {
-        arguments.push_back("-gsplit-dwarf");
-    }
-
     if (!job.inputFile().empty()) {
         arguments.push_back(job.inputFile());
     }
@@ -268,6 +261,8 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
     string argstxt;
 
     for (list<string>::const_iterator it = arguments.begin(); it != arguments.end(); ++it) {
+        if( *it == "-fdirectives-only" )
+            continue; // pointless locally, and it can break things
         argv.push_back(strdup(it->c_str()));
         argstxt += ' ';
         argstxt += *it;
@@ -278,21 +273,17 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
     trace() << "invoking:" << argstxt << endl;
 
     if (!local_daemon) {
-        int fd;
-
-        if (!dcc_lock_host(fd)) {
+        if (!dcc_lock_host()) {
             log_error() << "can't lock for local job" << endl;
             return EXIT_DISTCC_FAILED;
         }
-
-        lock_fd = fd;
     }
 
     bool color_output = job.language() != CompileJob::Lang_Custom
                         && colorify_wanted(job);
     int pf[2];
 
-    if (color_output && pipe(pf)) {
+    if (color_output && create_large_pipe(pf)) {
         color_output = false;
     }
 
@@ -322,11 +313,11 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
 
         execv(argv[0], &argv[0]);
         int exitcode = ( errno == ENOENT ? 127 : 126 );
-        log_perror("execv failed");
+        ostringstream errmsg;
+        errmsg << "execv " << argv[0] << " failed";
+        log_perror(errmsg.str());
 
-        if (lock_fd) {
-            dcc_unlock(lock_fd);
-        }
+        dcc_unlock();
 
         {
             char buf[256];
@@ -392,9 +383,7 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
         raise(user_break_signal);
     }
 
-    if (lock_fd) {
-        dcc_unlock(lock_fd);
-    }
+    dcc_unlock();
 
     return status;
 }

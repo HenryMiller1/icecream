@@ -16,8 +16,7 @@ icecc_SOURCES = \
 	main.cpp 
 icecc_LDADD = \
 	libclient.a \
-	../services/libicecc.la \
-	$(LIBRSYNC)
+	../services/libicecc.la
 
 noinst_HEADERS = \
 	argv.h \
@@ -30,6 +29,8 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/
 
 EXTRA_DIST = icecc-create-env
+
+AM_LIBTOOLFLAGS = --silent
 
 install-exec-local:
 	$(mkinstalldirs) $(DESTDIR)$(bindir)

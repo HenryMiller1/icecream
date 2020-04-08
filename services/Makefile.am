@@ -1,7 +1,8 @@
 lib_LTLIBRARIES = libicecc.la
-libicecc_la_SOURCES = job.cpp comm.cpp exitcode.cpp getifaddrs.cpp logging.cpp tempfile.c platform.cpp gcc.cpp
+libicecc_la_SOURCES = job.cpp comm.cpp exitcode.cpp getifaddrs.cpp logging.cpp ncpus.c pipes.cpp tempfile.c platform.cpp gcc.cpp util.cpp
 libicecc_la_LIBADD = \
 	$(LZO_LDADD) \
+	$(ZSTD_LDADD) \
 	$(CAPNG_LDADD) \
 	$(DL_LDADD)
 
@@ -18,9 +19,13 @@ noinst_HEADERS = \
 	exitcode.h \
 	getifaddrs.h \
 	logging.h \
+	ncpus.h \
+	pipes.h \
 	tempfile.h \
 	platform.h \
 	util.h
 
 pkgconfigdir = $(libdir)/pkgconfig
 pkgconfig_DATA = icecc.pc
+
+AM_LIBTOOLFLAGS = --silent

@@ -57,15 +57,32 @@ inline int str_startswith(const char *head, const char *worm)
 
 /* Some files should always be built locally... */
 static bool
-should_always_build_locally(const string &filename)
+should_always_build_locally(const string &filepath)
 {
-    string p;
+    string p = find_basename(filepath);
+    const char *filename = p.c_str();
 
-    p = find_basename(filename);
-
-    if (str_startswith("conftest.", p.c_str())
-        || str_startswith("tmp.conftest.", p.c_str())) {
+    /* autoconf */
+    if (str_startswith("conftest.", filename)
+        || str_startswith("tmp.conftest.", filename)) {
         return true;
+    }
+
+    static const char* const cmake_checks[] = {
+        "CheckIncludeFile.",
+        "CheckFunctionExists.",
+        "CheckSymbolExists.",
+        "CheckTypeSize.",
+        "CheckPrototypeDefinition.",
+    };
+
+    /* cmake */
+    if (str_startswith("Check", filename)) {
+        for( size_t i = 0; i < sizeof( cmake_checks ) / sizeof( cmake_checks[ 0 ] ); ++i ) {
+            if (str_startswith( cmake_checks[ i ], filename)) {
+                return true;
+            }
+        }
     }
 
     return false;
@@ -75,35 +92,15 @@ static bool analyze_program(const char *name, CompileJob &job, bool& icerun)
 {
     string compiler_name = find_basename(name);
 
-    string::size_type pos = compiler_name.rfind('/');
-
-    if (pos != string::npos) {
-        compiler_name = compiler_name.substr(pos);
-    }
-
     job.setCompilerName(compiler_name);
-
-    string suffix = compiler_name;
-
-    if (compiler_name.size() > 2) {
-        suffix = compiler_name.substr(compiler_name.size() - 2);
-    }
-
-    // Check for versioned compilers, eg: "gcc-4.8", "clang++-3.6".
-    bool vgcc = compiler_name.find("gcc-") != string::npos;
-    bool vgpp = compiler_name.find("g++-") != string::npos;
-    bool vclang = compiler_name.find("clang-") != string::npos;
-    bool vclangpp = compiler_name.find("clang++-") != string::npos;
 
     if( icerun ) {
         job.setLanguage(CompileJob::Lang_Custom);
         log_info() << "icerun, running locally." << endl;
         return true;
-    } else if ((suffix == "++") || (suffix == "CC") || vgpp || vclangpp) {
+    } else if( is_cpp_compiler(compiler_name)) {
         job.setLanguage(CompileJob::Lang_CXX);
-    } else if ((suffix == "cc") || vgcc || vclang) {
-        job.setLanguage(CompileJob::Lang_C);
-    } else if (compiler_name == "clang") {
+    } else if( is_c_compiler(compiler_name)) {
         job.setLanguage(CompileJob::Lang_C);
     } else {
         job.setLanguage(CompileJob::Lang_Custom);
@@ -210,6 +207,8 @@ static bool is_argument_with_space(const char* argument)
         "-iprefix",
         "--include-prefix",
         "-iquote",
+        "-include",
+        "-include-pch",
         "-isysroot",
         "-isystem",
         "-isystem-after",
@@ -231,11 +230,69 @@ static bool is_argument_with_space(const char* argument)
     return false;
 }
 
+static bool analyze_assembler_arg(string &arg, list<string> *extrafiles)
+{
+    const char *pos = arg.c_str();
+    static bool second_option;
+
+    if (second_option) {
+        second_option = false;
+        return false;
+    }
+
+    if (str_startswith("-a", pos)) {
+        /* -a[a-z]*=output, which directs the listing to the named file
+         * and cannot be remote.
+         */
+        pos += 2;
+
+        while ((*pos >= 'a') && (*pos <= 'z')) {
+            pos++;
+        }
+
+        if (*pos == '=') {
+            return true;
+        }
+
+        return false;
+    } else if (str_equal("--debug-prefix-map", pos) ||
+               str_equal("--defsym", pos)) {
+        second_option = true;
+        return false;
+    } else if (pos[0] == '@') {
+        /* If a build system passes an @FILE argument we'd need to
+         * parse the file for more arguments. Instead, we'll just
+         * run locally.
+         */
+        return true;
+    } else if (arg[0] == '-') {
+        /* All other option arguments should be safe to run remotely. */
+        return false;
+    } else {
+        /* Some build systems pass directly additional assembler files.
+         * Example: -Wa,src/code16gcc.s
+         * Thus, if any option doesn't start with a dash we need to
+         * add an extra file to the compile step.
+         */
+
+        if (access(arg.c_str(), R_OK) == 0) {
+            arg = get_absfilename(arg);
+            extrafiles->push_back(arg);
+            return false;
+        } else {
+            log_info() << "file for argument missing, building locally" << endl;
+            return true;
+        }
+
+        return false;
+    }
+}
+
+
 bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<string> *extrafiles)
 {
     ArgumentsList args;
     string ofile;
-    string dwofile;
 
 #if CLIENT_DEBUG > 1
     trace() << "scanning arguments" << endl;
@@ -258,6 +315,7 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
     bool wunused_macros = false;
     bool seen_arch = false;
     bool seen_pedantic = false;
+    const char *standard = NULL;
     // if rewriting includes and precompiling on remote machine, then cpp args are not local
     Argument_Type Arg_Cpp = compiler_only_rewrite_includes(job) ? Arg_Rest : Arg_Local;
 
@@ -276,7 +334,9 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
                 log_info() << "preprocessing, building locally" << endl;
             } else if (!strncmp(a, "-fdump", 6)
                        || !strcmp(a, "-combine")
-                       || !strcmp(a, "-fsyntax-only")) {
+                       || !strcmp(a, "-fsyntax-only")
+                       || !strncmp(a, "-ftime-report", strlen("-ftime-report"))
+                       || !strcmp(a, "-ftime-trace")) {
                 always_local = true;
                 args.append(a, Arg_Local);
                 log_info() << "argument " << a << ", building locally" << endl;
@@ -291,12 +351,14 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
                 args.append(a, Arg_Local);
                 /* These just modify the behaviour of other -M* options and do
                  * nothing by themselves. */
-            } else if (!strcmp(a, "-MF")) {
+            } else if (!strcmp(a, "-MF") || str_startswith("-Wp,-MF", a)) {
                 seen_mf = true;
                 args.append(a, Arg_Local);
                 args.append(argv[++i], Arg_Local);
                 /* as above but with extra argument */
-            } else if (!strcmp(a, "-MT") || !strcmp(a, "-MQ")) {
+            } else if (!strcmp(a, "-MT") || !strcmp(a, "-MQ") ||
+                       str_startswith("-Wp,-MT", a) ||
+                       str_startswith("-Wp,-MQ", a)) {
                 args.append(a, Arg_Local);
                 args.append(argv[++i], Arg_Local);
                 /* as above but with extra argument */
@@ -334,52 +396,31 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
                     }
                 }
             } else if (str_startswith("-Wa,", a)) {
-                /* Options passed through to the assembler.  The only one we
-                 * need to handle so far is -al=output, which directs the
-                 * listing to the named file and cannot be remote.  There are
-                 * some other options which also refer to local files,
-                 * but most of them make no sense when called via the compiler,
-                 * hence we only look for -a[a-z]*= and localize the job if we
-                 * find it.
+                /* The -Wa option specifies a list of arguments
+                 * that are passed to the assembler.
+                 * We split them into individual arguments and
+                 * call analyze_assembler_arg() for each one.
                  */
-                const char *pos = a;
+                const char *pos = a + 4, *next_comma;
                 bool local = false;
+                string as_arg;
+                string remote_arg = "-Wa";
 
-                while ((pos = strstr(pos + 1, "-a"))) {
-                    pos += 2;
+                while (1) {
+                    next_comma = strchr(pos, ',');
 
-                    while ((*pos >= 'a') && (*pos <= 'z')) {
-                        pos++;
-                    }
+                    if (next_comma)
+                        as_arg.assign(pos, next_comma - pos);
+                    else
+                        as_arg = pos;
 
-                    if (*pos == '=') {
-                        local = true;
+                    local = analyze_assembler_arg(as_arg, extrafiles);
+                    remote_arg += "," + as_arg;
+
+                    if (!next_comma)
                         break;
-                    }
 
-                    if (!*pos) {
-                        break;
-                    }
-                }
-
-                /* Some weird build systems pass directly additional assembler files.
-                 * Example: -Wa,src/code16gcc.s
-                 * Need to handle it locally then. Search if the first part after -Wa, does not start with -
-                 */
-                pos = a + 3;
-
-                while (*pos) {
-                    if ((*pos == ',') || (*pos == ' ')) {
-                        pos++;
-                        continue;
-                    }
-
-                    if (*pos == '-') {
-                        break;
-                    }
-
-                    local = true;
-                    break;
+                    pos = next_comma + 1;
                 }
 
                 if (local) {
@@ -387,12 +428,13 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
                     args.append(a, Arg_Local);
                     log_info() << "argument " << a << ", building locally" << endl;
                 } else {
-                    args.append(a, Arg_Remote);
+                    args.append(remote_arg, Arg_Remote);
                 }
             } else if (!strcmp(a, "-S")) {
                 seen_s = true;
             } else if (!strcmp(a, "-fprofile-arcs")
                        || !strcmp(a, "-ftest-coverage")
+                       || !strcmp(a, "--coverage")
                        || !strcmp(a, "-frepo")
                        || !strcmp(a, "-fprofile-generate")
                        || !strcmp(a, "-fprofile-use")
@@ -403,14 +445,17 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
                 always_local = true;
                 args.append(a, Arg_Local);
             } else if (!strcmp(a, "-gsplit-dwarf")) {
+                args.append(a, Arg_Rest);
                 seen_split_dwarf = true;
             } else if (str_equal(a, "-x")) {
                 args.append(a, Arg_Rest);
                 bool unsupported = true;
+                std::string unsupported_opt = "??";
                 if (const char *opt = argv[i + 1]) {
                     ++i;
                     args.append(opt, Arg_Rest);
-                    if (str_equal(opt, "c++") || str_equal(opt, "c")) {
+                    unsupported_opt = opt;
+                    if (str_equal(opt, "c++") || str_equal(opt, "c") || str_equal(opt, "objective-c") || str_equal(opt, "objective-c++")) {
                         CompileJob::Language lang = CompileJob::Lang_Custom;
                         if( str_equal(opt, "c")) {
                             lang = CompileJob::Lang_C;
@@ -428,12 +473,12 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
                     }
                 }
                 if (unsupported) {
-                    log_info() << "unsupported -x option; running locally" << endl;
+                    log_info() << "unsupported -x option: " << unsupported_opt << "; running locally" << endl;
                     always_local = true;
                 }
             } else if (!strcmp(a, "-march=native") || !strcmp(a, "-mcpu=native")
                        || !strcmp(a, "-mtune=native")) {
-                log_info() << "-{march,mpcu,mtune}=native optimizes for local machine, " 
+                log_info() << "-{march,mpcu,mtune}=native optimizes for local machine, "
                            << "building locally"
                            << endl;
                 always_local = true;
@@ -466,44 +511,6 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
                     log_info() << "output to stdout?  running locally" << endl;
                     always_local = true;
                 }
-            } else if (str_equal("-include", a)) {
-                /* This has a duplicate meaning. it can either include a file
-                   for preprocessing or a precompiled header. decide which one.  */
-
-                args.append(a, Arg_Local);
-                if (argv[i + 1]) {
-                    ++i;
-                    std::string p = argv[i];
-                    string::size_type dot_index = p.find_last_of('.');
-
-                    if (dot_index != string::npos) {
-                        string ext = p.substr(dot_index + 1);
-
-                        if (ext[0] != 'h' && ext[0] != 'H' && access(p.c_str(), R_OK) < 0
-                            && access((p + ".gch").c_str(), R_OK) < 0) {
-                            log_info() << "include file or gch file for argument " << a << " " << p
-                                       << " missing, building locally" << endl;
-                            always_local = true;
-                        }
-                    } else {
-                        log_info() << "argument " << a << " " << p << ", building locally" << endl;
-                        always_local = true;    /* Included file is not header.suffix or header.suffix.gch! */
-                    }
-
-                    args.append(argv[i], Arg_Local);
-                }
-            } else if (str_equal("-include-pch", a)) {
-                /* Clang's precompiled header, it's probably not worth it sending the PCH file. */
-                args.append(a, Arg_Local);
-                if (argv[i + 1]) {
-                    ++i;
-                    args.append(argv[i], Arg_Local);
-                    if(access(argv[i], R_OK) < 0) {
-                        log_info() << "pch file for argument " << a << " " << argv[i]
-                                   << " missing, building locally" << endl;
-                        always_local = true;
-                    }
-                }
             } else if (str_equal("-D", a) || str_equal("-U", a)) {
                 args.append(a, Arg_Cpp);
 
@@ -533,6 +540,8 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
                        || str_equal("-iprefix", a)
                        || str_equal("--include-prefix", a)
                        || str_equal("-iquote", a)
+                       || str_equal("-include", a)
+                       || str_equal("-include-pch", a)
                        || str_equal("-isysroot", a)
                        || str_equal("-isystem", a)
                        || str_equal("-isystem-after", a)
@@ -557,6 +566,11 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
 
                     args.append(argv[i], Arg_Local);
                 }
+            } else if (str_equal("-fmodules", a)
+                       || str_equal("-fcxx-modules", a)
+                       || str_equal("-fmodules-ts", a)
+                       || str_startswith("-fmodules-cache-path=", a)) {
+                args.append(a, Arg_Local);
             } else if (str_startswith("-Wp,", a)
                        || str_startswith("-D", a)
                        || str_startswith("-U", a)) {
@@ -574,7 +588,8 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
                        || str_equal("-MG", a)
                        || str_equal("-MP", a)) {
                 args.append(a, Arg_Local);
-            } else if (str_equal("-Wmissing-include-dirs", a)) {
+            } else if (str_equal("-Wmissing-include-dirs", a)
+                       || str_equal("-Werror=missing-include-dirs", a)) {
                 args.append(a, Arg_Local);
             } else if (str_equal("-fno-color-diagnostics", a)) {
                 explicit_color_diagnostics = true;
@@ -648,6 +663,15 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
                             args.append(file, Arg_Rest);
                             i += 2;
                         }
+                    } else if( str_equal( "-building-pch-with-obj", p )) {
+                        // We strip the arguments loading the PCH when building remotely,
+                        // so the object file would not contain anything from the PCH,
+                        // leading to link errors later when other objects would assume
+                        // this object file would provide some symbols from the PCH.
+                        log_info() << "argument " << a << " " << p << ", building locally" << endl;
+                        always_local = true;
+                        args.append(a, Arg_Rest);
+                        args.append(p, Arg_Rest);
                     } else {
                         args.append(a, Arg_Rest);
                         args.append(p, Arg_Rest);
@@ -662,7 +686,8 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
             } else if (str_startswith("--target=", a)) {
                 seen_target = true;
                 args.append(a, Arg_Rest);
-            } else if (str_equal("-Wunused-macros", a)) {
+            } else if (str_equal("-Wunused-macros", a)
+                       || str_equal("-Werror=unused-macros", a)) {
                 wunused_macros = true;
                 args.append(a, Arg_Rest);
             } else if (str_equal("-Wno-unused-macros", a)) {
@@ -750,7 +775,7 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
                 ifile = it->first;
                 it = args.erase(it);
                 if (should_always_build_locally(ifile)) {
-                    log_info() << "autoconf tests are run locally: "
+                    log_info() << "configure tests are run locally: "
                                << ifile << endl;
                     always_local = true;
                 }
@@ -765,7 +790,7 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
         }
 
         if (ifile.find('.') != string::npos) {
-            string::size_type dot_index = ifile.find_last_of('.');
+            string::size_type dot_index = ifile.rfind('.');
             string ext = ifile.substr(dot_index + 1);
 
             if (ext == "cc"
@@ -806,16 +831,11 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
                 } else {
                     ofile += ".o";
                 }
-
-                string::size_type slash = ofile.find_last_of('/');
-
-                if (slash != string::npos) {
-                    ofile = ofile.substr(slash + 1);
-                }
+                ofile = find_basename(ofile);
             }
 
             if (!always_local && seen_md && !seen_mf) {
-                string dfile = ofile.substr(0, ofile.find_last_of('.')) + ".d";
+                string dfile = ofile.substr(0, ofile.rfind('.')) + ".d";
 
 #if CLIENT_DEBUG
                 log_info() << "dep file: " << dfile << endl;
@@ -856,8 +876,11 @@ bool analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<s
         job.setBlockRewriteIncludes(true);
     }
 
-    // -pedantic doeesn't work with remote preprocessing
-    if( seen_pedantic ) {
+    // -pedantic doesn't work with remote preprocessing, if extensions to a named standard
+    // are allowed.  GCC allows GNU extensions by default, so let's check if a standard
+    // other than eg gnu11 or gnu++14 was specified.
+    if( seen_pedantic && !compiler_is_clang(job) && (!standard || str_startswith("gnu", standard)) ) {
+        log_info() << "argument -pedantic, forcing local preprocessing" << endl;
         job.setBlockRewriteIncludes(true);
     }
 

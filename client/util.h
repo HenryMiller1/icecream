@@ -20,7 +20,12 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
+#ifndef _CLIENT_UTIL_H_
+#define _CLIENT_UTIL_H_
+
 #include <string>
+
+#include "../services/util.h"
 
 class CompileJob;
 
@@ -28,8 +33,6 @@ class CompileJob;
 extern int set_cloexec_flag(int desc, int value);
 extern int dcc_ignore_sigpipe(int val);
 
-extern std::string find_basename(const std::string &sfile);
-extern std::string find_prefix(const std::string &basename);
 extern void colorify_output(const std::string &s_ccout);
 extern bool colorify_wanted(const CompileJob &job);
 extern bool compiler_has_color_output(const CompileJob &job);
@@ -39,5 +42,14 @@ extern int resolve_link(const std::string &file, std::string &resolved);
 extern std::string get_cwd();
 extern std::string read_command_output(const std::string& command);
 
-extern bool dcc_unlock(int lock_fd);
-extern bool dcc_lock_host(int &lock_fd);
+extern bool dcc_lock_host();
+extern void dcc_unlock();
+extern int dcc_locked_fd();
+
+class HostUnlock
+{
+public:
+    ~HostUnlock() { dcc_unlock(); }
+};
+
+#endif

@@ -5,6 +5,7 @@
 # GPL
 
 target_files=
+add_file_duplicates=
 
 # Optional path to strip from all paths if present, e.g. if the compiler is not in /usr.
 stripprefix=
@@ -18,10 +19,11 @@ esac
 usage ()
 {
     echo "Create compiler environment for distributed build."
-    echo "Usage: $0 <compiler_binary>"
+    echo "Usage: $0 <compiler_binary> [extra_options]"
     echo "For GCC, pass the the gcc binary, the matching g++ will be used automatically."
     echo "For Clang, pass the clang binary."
     echo "Use --addfile <file> to add extra files."
+    echo "Use --compression <type> to set tarball type (none,gzip,bzip2,zstd,xz)."
     echo "For backwards compatibility, the following is also supported:"
     echo "$0 --gcc <gcc_path> <g++_path>"
     echo "$0 --clang <clang_path>"
@@ -32,6 +34,14 @@ is_contained ()
   case " $target_files " in
     *" $1 "* ) return 0 ;;
     *"=$1 "* ) return 0;;
+    * ) return 1 ;;
+  esac
+}
+
+is_add_file_duplicate ()
+{
+  case " $add_file_duplicates " in
+    *" $1 "* ) return 0 ;;
     * ) return 1 ;;
   esac
 }
@@ -57,15 +67,14 @@ abs_path()
 resolve_path()
 {
     local_path=$1
-    pushd / >/dev/null
     # pwd -P in abs_path will take care of resolving symlinks in the path,
     # so take care just of the file component itself
     while test -L "$local_path"; do
-        cd $(dirname $local_path)
-        local_path=$(readlink $local_path)
+        pushd $(dirname $local_path) >/dev/null 2>&1
+        local_path=$(abs_path $(readlink $(basename $local_path)))
+        popd > /dev/null 2>&1
     done
     abs_path $local_path
-    popd >/dev/null
 }
 
 # Avoid /../ components in paths such as /usr/X11/../lib64 .
@@ -80,12 +89,22 @@ convert_path_cdup ()
 
 add_file ()
 {
+  local skipldd=
+  if test "$1" = "skipldd"; then
+    skipldd=1
+    shift
+  fi
   local name="$1"
   local path="$1";
   if test -n "$2"; then
     name="$2"
   fi
   test -z "$name" && return
+
+  # it is faster to check as quickly as possible, is_contained checks duplicates too, but this saves time
+  is_add_file_duplicate "$name" && return
+  add_file_duplicates="$add_file_duplicates $name"
+
   path=$(resolve_path $path)
   name=$(convert_path_cdup $name)
   if test -n "$stripprefix"; then
@@ -98,7 +117,7 @@ add_file ()
   is_contained "$toadd" && return
   echo "adding file $toadd"
   target_files="$target_files $toadd"
-  if test -x "$path"; then
+  if test -x "$path" -a -z "$skipldd"; then
     # Only call ldd when it makes sense
     if file -L "$path" | grep 'ELF' > /dev/null 2>&1; then
 	if ! file -L "$path" | grep 'static' > /dev/null 2>&1; then
@@ -109,13 +128,46 @@ add_file ()
 		#         libc.so.6 => /lib/tls/libc.so.6 (0xb7e81000)
 		#         /lib/ld-linux.so.2 (0xb7fe8000)
 		# covering both situations ( with => and without )
+           local lib
            for lib in $(ldd "$path" | sed -n 's,^[^/]*\(/[^ ]*\).*,\1,p'); do
 	      test -f "$lib" || continue
-	      # Check wether the same library also exists in the parent directory,
+	      # Check whether the same library also exists in the parent directory,
 	      # and prefer that on the assumption that it is a more generic one.
 	      local baselib=$(echo "$lib" | sed 's,\(/[^/]*\)/.*\(/[^/]*\)$,\1\2,')
-	      test -f "$baselib" && lib=$baselib
-              add_file "$lib"
+              usebaselib=
+              if test "$baselib" != "$lib" -a -f "$baselib"; then
+                # Make sure the base lib has the same architecture.
+                local archlib="$(objdump -f "$lib" | grep architecture)"
+                local archbaselib="$(objdump -f "$baselib" | grep architecture)"
+                if test "$archlib" = "$archbaselib"; then
+                  usebaselib=1
+                fi
+              fi
+              if test -n "$usebaselib"; then
+                lib=$baselib
+                add_file "$lib"
+              else
+                # Optimization: We are adding a library we got from ldd output, so avoid
+                # using ldd on it, as it should not find more than this ldd.
+                add_file "skipldd" "$lib"
+              fi
+
+              # Add the non-haswell and non-avx512_1 libraries too
+              case "$lib" in
+                 */haswell/*|*/avx512_1/*)
+                    ;;
+                 *)
+                    continue
+                    ;;
+              esac
+              local lib_non_avx512=$(echo "$lib" | sed s,/avx512_1/,/,)
+              local lib_non_hsw=$(echo "$lib_non_avx512" | sed s,/haswell/,/,)
+              if [ "$lib" != "$lib_non_avx512" ] && [ -f "$lib_non_avx512" ]; then
+                add_file "$lib_non_avx512"
+              fi
+              if [ "$lib" != "$lib_non_hsw" ] && [ -f "$lib_non_hsw" ]; then
+                add_file "$lib_non_hsw"
+              fi
            done
         fi
     elif test "$is_darwin" = 1; then
@@ -139,7 +191,7 @@ add_file ()
 	    # and prefer that on the assumption that it is a more generic one.
 	    local baselib=$(echo "$lib" | sed 's,\(/[^/]*\)/.*\(/[^/]*\)$,\1\2,')
 	    test -f "$baselib" && lib=$baselib
-            add_file "$lib" "$libinstall"
+	          add_file "$lib" "$libinstall"
          done
     fi
   fi
@@ -266,10 +318,16 @@ else
         exit 1
     fi
     shift
-    if test -n "$1" -a "x$1" != "x--addfile"; then
-        # (backwards) compatibility, assume the second argument is the C++ compiler
-        added_gxx=$1
-        shift
+    if test -n "$1"; then
+        case "$1" in
+            --*)
+                ;; # an option, ignore
+            *)
+                # (backwards) compatibility, assume the second argument is the C++ compiler
+                added_gxx=$1
+                shift
+                ;;
+        esac
     fi
     if test -n "$gcc" -a -z "$added_gxx"; then
         # guess g++ from gcc
@@ -316,15 +374,63 @@ if test -n "$clang"; then
 fi
 
 extrafiles=
-while test "x$1" = "x--addfile"; do
-    shift
-    extrafiles="$extrafiles $1"
+compress_program=gzip
+compress_ext=.gz
+compress_args=
+
+while test -n "$1"; do
+
+    if test "x$1" = "x--addfile"; then
+        shift
+        extrafiles="$extrafiles $1"
+    elif test "x$1" = "x--compression"; then
+        shift
+        case "$1" in
+            none)
+                compress_ext=
+                compress_program=cat
+                ;;
+            gzip|gz)
+                compress_ext=.gz
+                compress_program=gzip
+                ;;
+            bzip2|bz2)
+                compress_ext=.bz2
+                compress_program=bzip2
+                ;;
+            zstd)
+                compress_ext=.zst
+                compress_program=zstd
+                # threads
+                compress_args=-T0
+                ;;
+            xz)
+                compress_ext=.xz
+                compress_program=xz
+                # threads
+                compress_args=-T0
+                if test -n "$ICECC_TESTS"; then
+                    compress_args="-T0 -0"
+                fi
+                ;;
+            *)
+                echo "Unknown compression type '$1'."
+                exit 1
+                ;;
+        esac
+    else
+        echo "Unknown argument '$1'"
+        exit 1
+    fi
+
     shift
 done
 
-if test -n "$1"; then
-    echo "Unknown argument '$1'"
-    exit 1
+if test -n "$compress_program"; then
+    if ! command -v "$compress_program" >/dev/null; then
+        echo "Cannot find compression program '$compress_program'."
+        exit 1
+    fi
 fi
 
 tempdir=$(mktemp -d /tmp/iceccenvXXXXXX)
@@ -362,6 +468,7 @@ fi
 
 if test -n "$clang"; then
     # getting compilers resolved path
+    orig_clang=$added_clang
     added_clang=$(resolve_path $added_clang)
     # In case clang is installed elsewhere.
     stripprefix=$(dirname $(dirname $added_clang))
@@ -372,8 +479,8 @@ if test -n "$clang"; then
     add_file $added_compilerwrapper /usr/bin/gcc
     add_file $added_compilerwrapper /usr/bin/g++
 
-    search_addfile $added_clang as /usr/bin
-    search_addfile $added_clang objcopy /usr/bin
+    search_addfile $orig_clang as /usr/bin
+    search_addfile $orig_clang objcopy /usr/bin
 
     # HACK: Clang4.0 and later access /proc/cpuinfo and report an error when they fail
     # to find it, even if they use a fallback mechanism, making the error useless
@@ -384,17 +491,6 @@ if test -n "$clang"; then
         touch $tempdir/fakeproc/proc/cpuinfo
         add_file $tempdir/fakeproc/proc/cpuinfo /proc/cpuinfo
     fi
-
-    # clang always uses its internal .h files
-    clangincludes=$($added_clang -print-file-name=include/limits.h)
-    if test -z "$clangincludes"; then
-        echo $added_clang cannot find its includes
-        exit 1
-    fi
-    clangincludes=$(dirname $(abs_path $clangincludes))
-    for file in $(find $clangincludes -type f); do
-      add_file "$file"
-    done
 fi
 
 # Do not do any prefix stripping on extra files, they (e.g. clang plugins) are usually
@@ -432,11 +528,6 @@ if test -f /etc/ld.so.conf; then
   add_file $tmp_ld_so_conf /etc/ld.so.conf
 fi
 
-# special case for weird multilib setups
-for dir in /lib /lib64 /usr/lib /usr/lib64; do
-    test -L $dir && cp -p $dir $tempdir$dir
-done
-
 new_target_files=
 for i in $target_files; do
  case $i in
@@ -450,7 +541,13 @@ for i in $target_files; do
     ;;
   esac
   mkdir -p $tempdir/$(dirname $target)
-  cp -p $path $tempdir/$target
+  if test -x $path && objcopy -p --strip-unneeded $path $tempdir/$target 2>/dev/null; then
+    true # ok
+  elif test -x $path && objcopy -p -g $path $tempdir/$target 2>/dev/null; then
+    true # ok
+  else
+    cp -p $path $tempdir/$target
+  fi
   target=$(echo $target | cut -b2-)
   new_target_files="$new_target_files $target"
 done
@@ -458,7 +555,11 @@ done
 if test -x /sbin/ldconfig -a "$is_linux" = 1; then
    mkdir -p $tempdir/var/cache/ldconfig
    /sbin/ldconfig -r $tempdir
-   new_target_files="$new_target_files etc/ld.so.cache"
+   for candidate in etc var/cache/ldconfig; do
+        test -e $tempdir/$candidate/ld.so.cache || continue;
+        new_target_files="$new_target_files $candidate/ld.so.cache"
+        break
+   done
 fi
 
 md5sum=NONE
@@ -476,17 +577,19 @@ md5=$(for i in $target_files; do $md5sum $tempdir/$i; done | sed -e "s# $tempdir
   echo "Couldn't compute MD5 sum."
   exit 2
 }
-echo "creating $md5.tar.gz"
+
+echo "creating $md5.tar$compress_ext"
 mydir=$(pwd)
 cd $tempdir
-tar -czh --numeric-owner -f "$mydir/$md5".tar.gz $target_files || {
+tar -ch --numeric-owner -f - $target_files | "$compress_program" $compress_args > "$md5".tar"$compress_ext" || {
   echo "Couldn't create archive"
   exit 3
 }
+mv "$md5".tar"$compress_ext" "$mydir"/
 cd ..
 rm -rf $tempdir
 rm -f $tmp_ld_so_conf
 
 # Print the tarball name to fd 5 (if it's open, created by whatever has invoked this)
-( echo $md5.tar.gz >&5 ) 2>/dev/null
+( echo $md5.tar"$compress_ext" >&5 ) 2>/dev/null
 exit 0

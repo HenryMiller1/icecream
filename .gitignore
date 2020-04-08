@@ -49,3 +49,7 @@ tests/testargs
 tests/testargs.log
 tests/testargs.trs
 tests/test-setup.sh
+tests/listing.txt
+
+#QtCreator project settings
+CMakeLists.txt.user

@@ -3,7 +3,8 @@
 /*
     This file is part of Icecream.
 
-    Copyright (C) 2002, 2003 by Martin Pool <mbp@samba.org>
+    Copyright (c) 2004 Michael Matz <matz@suse.de>
+                  2004 Stephan Kulow <coolo@suse.de>
 
     This program is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -20,12 +21,10 @@
     51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 */
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#ifndef SCHEDULER_H
+#define SCHEDULER_H
 
-    int dcc_ncpus(int *);
+// Values 0 to 3.
+#define DEBUG_SCHEDULER 0
 
-#ifdef __cplusplus
-}
 #endif
